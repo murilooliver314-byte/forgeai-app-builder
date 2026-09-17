@@ -62,7 +62,8 @@ def gemini_files(prompt, name):
 Nome do app: {name}
 Responda SOMENTE com JSON válido, sem markdown, neste formato exato:
 {{"name":"{name}","type":"tipo curto","files":{{"index.html":"...","styles.css":"...","app.js":"..."}}}}
-Regras: gere exatamente os três arquivos; use HTML sem bibliotecas externas; o index deve referenciar styles.css e app.js; inclua uma experiência bonita, funcional e mobile-first; não use explicações fora do JSON.''' 
+Regras: gere exatamente os três arquivos; use HTML sem bibliotecas externas; o index deve referenciar styles.css e app.js; inclua uma experiência bonita, funcional e mobile-first; não use explicações fora do JSON.
+Se a ideia mencionar VendaCertaAI, NÃO crie somente uma landing page. Crie um protótipo navegável completo em uma única aplicação, com telas/seções acionadas por botões para: tela inicial sem planos, Entrar, Iniciar teste grátis de 48 horas, loja pública, catálogo de produtos, conversa da vendedora somente por texto, pedidos, Meu acesso, códigos Básico/Pro/Enterprise e Central ADM. Use localStorage para simular dados e implemente navegação entre as telas. Inclua o slogan “Sua vendedora profissional com IA”, visual escuro neon roxo/rosa/azul e o Instagram https://www.instagram.com/geracao_ricabr?stkn=MXI0ZDlndDg1Yjk1aQ==.''' 
     payload = json.dumps({'contents':[{'parts':[{'text':instruction}]}], 'generationConfig':{'temperature':0.35,'maxOutputTokens':12000}}).encode()
     url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=' + quote(key)
     try:
