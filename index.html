@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0b0b12" />
+  <title>ForgeAI — Criador de aplicativos</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">✦</span><span>Forge<span class="accent">AI</span></span></div>
+      <button class="new-project" id="newProjectBtn"><span>＋</span> Novo aplicativo</button>
+      <nav class="nav">
+        <button class="nav-item active" data-page="dashboard"><span>⌂</span> Visão geral</button>
+        <button class="nav-item" data-page="projects"><span>▦</span> Meus aplicativos</button>
+        <button class="nav-item" data-page="templates"><span>◈</span> Templates</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-page="settings"><span>⚙</span> Configurações</button>
+        <div class="plan-card"><div class="plan-label">PLANO GRATUITO</div><strong>Seu próximo app começa aqui.</strong><div class="progress"><span></span></div><small>3 de 5 projetos usados</small><button class="upgrade-btn">Ver planos</button></div>
+        <div class="user-mini"><div class="avatar">MO</div><div><strong>Murilo Oliver</strong><small>Conta proprietária</small></div><span>⋮</span></div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar"><button class="mobile-menu" id="mobileMenu">☰</button><div class="breadcrumbs" id="breadcrumbs">Visão geral</div><div class="top-actions"><button class="icon-btn" title="Ajuda">?</button><button class="icon-btn" title="Notificações">♢<i></i></button><div class="top-avatar">MO</div></div></header>
+
+      <section class="page active-page" id="page-dashboard">
+        <div class="hero"><div><span class="eyebrow">SEU ESTÚDIO DE IA</span><h1>Transforme uma ideia<br><span class="gradient-text">em um aplicativo.</span></h1><p>Descreva o que você quer criar. A ForgeAI monta a estrutura, as telas e o código inicial para você.</p><button class="primary-btn" id="heroNewBtn">✦ Criar aplicativo com IA <span>→</span></button></div><div class="hero-art"><div class="orbit orbit-1"></div><div class="orbit orbit-2"></div><div class="sparkle s1">✦</div><div class="sparkle s2">✧</div><div class="phone-mock"><div class="phone-top"></div><div class="mock-line wide"></div><div class="mock-line"></div><div class="mock-card"></div><div class="mock-card short"></div><div class="mock-bottom"></div></div></div></div>
+        <div class="section-head"><div><h2>Visão geral</h2><p>Acompanhe seus aplicativos e crie algo novo.</p></div><button class="ghost-btn" data-page="projects">Ver todos →</button></div>
+        <div class="stats-grid"><div class="stat-card"><div class="stat-icon purple">▦</div><span>Aplicativos criados</span><strong id="statProjects">3</strong><small class="positive">↑ 1 este mês</small></div><div class="stat-card"><div class="stat-icon blue">↗</div><span>Publicações</span><strong>2</strong><small>Última há 4 dias</small></div><div class="stat-card"><div class="stat-icon pink">◷</div><span>Horas economizadas</span><strong>18h</strong><small class="positive">↑ 24% este mês</small></div><div class="stat-card"><div class="stat-icon orange">♧</div><span>Créditos de IA</span><strong>87</strong><small>De 100 disponíveis</small></div></div>
+        <div class="section-head recent-head"><div><h2>Projetos recentes</h2></div><button class="ghost-btn" data-page="projects">Ver todos →</button></div><div class="project-grid" id="recentProjects"></div>
+      </section>
+
+      <section class="page" id="page-projects"><div class="page-title"><div><span class="eyebrow">WORKSPACE</span><h1>Meus aplicativos</h1><p>Crie, edite e publique seus projetos.</p></div><button class="primary-btn" id="projectsNewBtn">＋ Novo aplicativo</button></div><div class="toolbar"><div class="search-box">⌕<input id="projectSearch" placeholder="Buscar aplicativo..." /></div><div class="filter-pills"><button class="pill active">Todos</button><button class="pill">Publicados</button><button class="pill">Rascunhos</button></div></div><div class="all-projects-grid" id="allProjects"></div></section>
+
+      <section class="page" id="page-templates"><div class="page-title"><div><span class="eyebrow">COMECE MAIS RÁPIDO</span><h1>Templates prontos</h1><p>Escolha uma base e personalize com a IA.</p></div></div><div class="template-grid" id="templateGrid"></div></section>
+
+      <section class="page" id="page-settings"><div class="page-title"><div><span class="eyebrow">PREFERÊNCIAS</span><h1>Configurações</h1><p>Gerencie sua conta e as preferências do estúdio.</p></div></div><div class="settings-layout"><div class="settings-nav"><button class="active">Perfil</button><button>Plano e créditos</button><button>Integrações</button><button>Domínio e publicação</button></div><div class="settings-panel"><h3>Perfil da conta</h3><p class="muted">Essas informações aparecem apenas no seu painel.</p><label>Nome completo<input value="Murilo Oliver" /></label><label>E-mail<input value="murilo@exemplo.com" /></label><label>Nome do workspace<input value="Meu Estúdio ForgeAI" /></label><div class="setting-row"><div><strong>Modo escuro</strong><small>Usar o tema escuro no editor</small></div><button class="toggle on"><span></span></button></div><button class="primary-btn">Salvar alterações</button></div></div></section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="newProjectModal"><div class="modal"><button class="close-modal" data-close>×</button><div class="modal-heading"><span class="modal-icon">✦</span><div><span class="eyebrow">NOVO PROJETO</span><h2>O que você quer criar?</h2><p>Conte sua ideia com suas próprias palavras. A IA cuidará do primeiro rascunho.</p></div></div><label class="prompt-label">Descreva seu aplicativo<textarea id="appPrompt" placeholder="Ex.: Quero um aplicativo de catálogo para minha loja de roupas, com produtos, carrinho e botão de WhatsApp..."></textarea></label><div class="suggestions"><span>Experimente:</span><button data-suggestion="um catálogo online para minha loja de roupas com botão de pedido">Catálogo de loja</button><button data-suggestion="um sistema simples de agendamento para salão de beleza">Agendamentos</button><button data-suggestion="um aplicativo de controle financeiro pessoal">Controle financeiro</button></div><div class="modal-footer"><span class="ai-note">✦ 2 créditos de IA serão usados</span><button class="primary-btn" id="generateBtn">Gerar meu aplicativo <span>→</span></button></div></div></div>
+
+  <div class="modal-backdrop" id="editorModal"><div class="editor-modal"><div class="editor-top"><div class="brand"><span class="brand-mark">✦</span>Forge<span class="accent">AI</span></div><div class="editor-project-name" id="editorProjectName">Meu aplicativo <span class="status-dot"></span><small>Rascunho salvo</small></div><div class="editor-actions"><button class="ghost-btn" id="openStudio">Abrir Studio completo</button><button class="ghost-btn" id="closeEditor">Sair do editor</button><button class="primary-btn" id="publishBtn">Publicar <span>↗</span></button></div></div><div class="editor-body"><aside class="editor-sidebar"><div class="editor-tab active">▣ Telas</div><div class="editor-tab">◌ Componentes</div><div class="editor-tab">⚙ Configurações</div><div class="screen-list"><div class="screen active"><span>⌂</span> Início <b>⋮</b></div><div class="screen"><span>▦</span> Produtos <b>⋮</b></div><div class="screen"><span>♧</span> Sobre <b>⋮</b></div><button class="add-screen">＋ Adicionar tela</button></div><div class="editor-help"><strong>✦ Assistente IA</strong><p>Quer mudar alguma coisa no seu app?</p><button id="aiEditBtn">Pedir alteração</button></div></aside><div class="canvas-area"><div class="canvas-toolbar"><button>↶</button><button>↷</button><span></span><button>−</button><strong>100%</strong><button>＋</button><span></span><button>▣ Desktop</button><button>▯ Mobile</button></div><div class="canvas"><div class="preview-app" id="previewApp"><div class="preview-nav"><strong id="previewBrand">Minha Loja</strong><span>☰</span></div><div class="preview-content"><div class="preview-hero"><small>SEJA BEM-VINDO</small><h2 id="previewTitle">Tudo para<br>facilitar seu dia.</h2><button>Conheça nossos produtos →</button></div><h3>Destaques</h3><div class="preview-products"><div><div class="product-img p1"></div><strong>Produto especial</strong><small>R$ 49,90</small></div><div><div class="product-img p2"></div><strong>Mais vendido</strong><small>R$ 79,90</small></div></div></div><div class="preview-bottom"><span>⌂<small>Início</small></span><span>▦<small>Produtos</small></span><span>♧<small>Contato</small></span></div></div></div></div><aside class="properties"><h3>Propriedades</h3><div class="prop-section"><label>Nome do aplicativo<input id="propName" value="Minha Loja" /></label><label>Cor principal<div class="color-input"><span></span><input value="#8B5CF6" /></div></label></div><div class="prop-section"><h4>Publicação</h4><div class="publish-info"><span class="status-dot"></span><div><strong>Não publicado</strong><small>Seu app está salvo como rascunho.</small></div></div><button class="full-btn" id="exportBtn">⇩ Exportar projeto</button></div></aside></div></div></div>
+  <div class="toast" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
