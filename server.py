@@ -74,7 +74,7 @@ Regras: gere exatamente os três arquivos; use HTML sem bibliotecas externas; o 
         result=json.loads(text)
         files=result.get('files',{})
         if all(k in files and isinstance(files[k],str) for k in ('index.html','styles.css','app.js')):
-            return {'files':files,'type':result.get('type','Aplicativo com IA')}
+            return {'files':files,'type':result.get('type','Aplicativo com IA'),'name':result.get('name',name)}
     except Exception:
         return None
     return None
@@ -107,6 +107,7 @@ def create_project(name, prompt):
     ai = gemini_files(prompt, name)
     if ai:
         kind = ai['type']
+        name = ai.get('name', name) or name
     
     project_id = slugify(name) + '-' + str(int(time.time()))
     folder = DATA / project_id
@@ -117,7 +118,7 @@ def create_project(name, prompt):
     archive = DATA / f'{project_id}.tar.gz'
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(folder, arcname=slugify(name))
-    return {'id':project_id,'name':name,'type':kind,'theme':theme,'status':'Rascunho','download':f'/download/{project_id}.tar.gz'}
+    return {'id':project_id,'name':name,'type':kind,'theme':theme,'status':'Rascunho','download':f'/download/{project_id}.tar.gz','files':files}
 
 
 class Handler(SimpleHTTPRequestHandler):
