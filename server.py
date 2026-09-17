@@ -132,6 +132,14 @@ def create_project(name, prompt):
     return {'id':project_id,'name':name,'type':kind,'theme':theme,'status':'Rascunho','download':f'/download/{project_id}.tar.gz','files':files}
 
 
+def vendacerta_page():
+    files=vendacerta_files()
+    page=files['index.html']
+    page=page.replace('<link rel="stylesheet" href="styles.css">','<style>'+files['styles.css']+'</style>')
+    page=page.replace('<script src="app.js"></script>','<script>'+files['app.js'].replace('</script>','<\\/script>')+'</script>')
+    return page.encode('utf-8')
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -140,6 +148,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
     def do_GET(self):
         path=urlparse(self.path).path
+        if path in ('/vendacertaai','/vendacertaai/'):
+            raw=vendacerta_page(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if path=='/api/health': return self.end_json({'ok':True,'service':'ForgeAI'})
         if path.startswith('/download/'):
             file=DATA / Path(path).name
