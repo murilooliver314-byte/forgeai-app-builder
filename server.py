@@ -1,7 +1,7 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, quote, parse_qs
-import json, re, html, tarfile, io, time, os, urllib.request, urllib.error, hashlib, hmac, secrets
+import json, re, html, tarfile, io, time, os, urllib.request, urllib.error, hashlib, hmac, secrets, threading, tempfile
 
 ROOT = Path(__file__).parent.resolve()
 DATA = ROOT / 'generated'
@@ -10,6 +10,14 @@ STORE_FILE = DATA / 'stores.json'
 AUTH_FILE = DATA / 'auth.json'
 ORDER_FILE = DATA / 'orders.json'
 CHAT_FILE = DATA / 'conversations.json'
+PAYMENT_HISTORY_FILE = DATA / 'payment_history.json'
+AUDIT_FILE = DATA / 'audit.json'
+ACCESS_CODE_FILE = DATA / 'access_codes.json'
+BACKUP_DIR = DATA / 'backups'
+BACKUP_DIR.mkdir(exist_ok=True)
+SESSION_TTL = 30 * 86400
+MAX_BODY_BYTES = 512 * 1024
+DATA_LOCK = threading.RLock()
 AGENT_FILE = DATA / 'agent_settings.json'
 CUSTOMER_FILE = DATA / 'customers.json'
 PUBLIC_BASE = 'https://forgeai-app-builder.onrender.com'
@@ -22,17 +30,69 @@ PLAN_LABELS = {'BASICO':'Básico','PRO':'Pro','ENTERPRISE':'Enterprise'}
 DEFAULT_PRODUCTS = [{'name':'Produto especial','desc':'Qualidade e estilo para você.','price':'R$ 49,90'},{'name':'Mais vendido','desc':'O favorito dos clientes.','price':'R$ 79,90'},{'name':'Novidade','desc':'Acabou de chegar na loja.','price':'R$ 99,90'}]
 
 
-def auth_data():
+
+def load_json(path, default):
     try:
-        data=json.loads(AUTH_FILE.read_text(encoding='utf-8')) if AUTH_FILE.exists() else {}
-        if isinstance(data,dict): return {'users':data.get('users',{}),'sessions':data.get('sessions',{})}
+        if path.exists():
+            value=json.loads(path.read_text(encoding='utf-8'))
+            return value
     except Exception:
-        pass
-    return {'users':{},'sessions':{}}
+        # Recover from the most recent local backup after a torn write.
+        try:
+            candidates=sorted(BACKUP_DIR.glob(path.name+'.*.bak'), reverse=True)
+            if candidates:
+                return json.loads(candidates[0].read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    return default
+
+
+def atomic_save(path, value):
+    raw=json.dumps(value, ensure_ascii=False, indent=2)
+    with DATA_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                backup=BACKUP_DIR / (path.name+'.'+str(int(time.time()*1000))+'.bak')
+                backup.write_text(path.read_text(encoding='utf-8'), encoding='utf-8')
+                old=sorted(BACKUP_DIR.glob(path.name+'.*.bak'), reverse=True)
+                for stale in old[8:]:
+                    try: stale.unlink()
+                    except OSError: pass
+            except Exception:
+                pass
+        fd,tmp=tempfile.mkstemp(prefix='.'+path.name+'.', dir=str(path.parent))
+        try:
+            with os.fdopen(fd,'w',encoding='utf-8') as fh:
+                fh.write(raw); fh.flush(); os.fsync(fh.fileno())
+            os.replace(tmp,path)
+        finally:
+            if os.path.exists(tmp):
+                try: os.unlink(tmp)
+                except OSError: pass
+
+
+def audit_event(slug, event, details=None):
+    with DATA_LOCK:
+        data=load_json(AUDIT_FILE,{})
+        if not isinstance(data,dict): data={}
+        events=data.setdefault(str(slug),[])
+        events.append({'id':secrets.token_hex(10),'event':str(event)[:80],'details':details if isinstance(details,dict) else {},'at':time.time()})
+        data[str(slug)]=events[-500:]
+        atomic_save(AUDIT_FILE,data)
+
+
+def auth_data():
+    data=load_json(AUTH_FILE,{})
+    if not isinstance(data,dict): data={}
+    users=data.get('users',{}) if isinstance(data.get('users',{}),dict) else {}
+    sessions=data.get('sessions',{}) if isinstance(data.get('sessions',{}),dict) else {}
+    admin_sessions=data.get('admin_sessions',{}) if isinstance(data.get('admin_sessions',{}),dict) else {}
+    return {'users':users,'sessions':sessions,'admin_sessions':admin_sessions}
 
 
 def save_auth(data):
-    AUTH_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    atomic_save(AUTH_FILE,data)
 
 
 def password_hash(password, salt=None):
@@ -45,125 +105,154 @@ def session_user(handler):
     token=''
     for part in handler.headers.get('Cookie','').split(';'):
         if part.strip().startswith('vc_session='): token=part.strip().split('=',1)[1]
-    data=auth_data(); email=data['sessions'].get(token)
+    data=auth_data(); entry=data['sessions'].get(token)
+    if isinstance(entry,str):
+        # Migrate legacy sessions lazily; old sessions expire after this request.
+        email=entry; entry={'email':email,'created_at':time.time()}
+        data['sessions'][token]=entry; save_auth(data)
+    if not isinstance(entry,dict): return None
+    if time.time()-float(entry.get('created_at',0) or 0)>SESSION_TTL:
+        data['sessions'].pop(token,None); save_auth(data); return None
+    email=str(entry.get('email','')).lower()
     return data['users'].get(email) if email else None
 
 
-def set_session(handler, token):
-    handler.send_header('Set-Cookie',f'vc_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000')
+def set_session(handler, token, admin=False):
+    name='vc_admin' if admin else 'vc_session'
+    handler.send_header('Set-Cookie',f'{name}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={SESSION_TTL}')
 
 
 def store_products(slug='vendacertaai'):
-    try:
-        data=json.loads(STORE_FILE.read_text(encoding='utf-8')) if STORE_FILE.exists() else {}
-        products=data.get(slug)
-        if isinstance(products,list) and products: return products
-    except Exception:
-        pass
+    data=load_json(STORE_FILE,{})
+    products=data.get(str(slug)) if isinstance(data,dict) else None
+    if isinstance(products,list) and products: return products
     return DEFAULT_PRODUCTS.copy()
 
 
 def save_store_products(slug, products):
-    data={}
-    try:
-        data=json.loads(STORE_FILE.read_text(encoding='utf-8')) if STORE_FILE.exists() else {}
-    except Exception:
-        data={}
-    data[slug]=products
-    STORE_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    with DATA_LOCK:
+        data=load_json(STORE_FILE,{})
+        if not isinstance(data,dict): data={}
+        data[str(slug)]=products
+        atomic_save(STORE_FILE,data)
 
 
 def store_orders(slug='vendacertaai'):
-    try:
-        data=json.loads(ORDER_FILE.read_text(encoding='utf-8')) if ORDER_FILE.exists() else {}
-        orders=data.get(slug,[])
-        return orders if isinstance(orders,list) else []
-    except Exception:
-        return []
+    data=load_json(ORDER_FILE,{})
+    orders=data.get(str(slug),[]) if isinstance(data,dict) else []
+    return orders if isinstance(orders,list) else []
 
 
 def save_store_orders(slug, orders):
-    data={}
-    try:
-        data=json.loads(ORDER_FILE.read_text(encoding='utf-8')) if ORDER_FILE.exists() else {}
-    except Exception:
-        data={}
-    data[slug]=orders
-    ORDER_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    with DATA_LOCK:
+        data=load_json(ORDER_FILE,{})
+        if not isinstance(data,dict): data={}
+        data[str(slug)]=orders
+        atomic_save(ORDER_FILE,data)
 
 
 def conversation_history(slug, session_id):
-    try:
-        data=json.loads(CHAT_FILE.read_text(encoding='utf-8')) if CHAT_FILE.exists() else {}
-        history=data.get(slug,{}).get(session_id,[])
-        return history if isinstance(history,list) else []
-    except Exception:
-        return []
+    data=load_json(CHAT_FILE,{})
+    history=data.get(str(slug),{}).get(str(session_id),[]) if isinstance(data,dict) and isinstance(data.get(str(slug),{}),dict) else []
+    return history if isinstance(history,list) else []
 
 
 def save_conversation(slug, session_id, history):
-    data={}
-    try:
-        data=json.loads(CHAT_FILE.read_text(encoding='utf-8')) if CHAT_FILE.exists() else {}
-    except Exception:
-        data={}
-    data.setdefault(slug,{})[session_id]=history[-20:]
-    CHAT_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    with DATA_LOCK:
+        data=load_json(CHAT_FILE,{})
+        if not isinstance(data,dict): data={}
+        data.setdefault(str(slug),{})[str(session_id)]=history[-20:]
+        atomic_save(CHAT_FILE,data)
 
 
 def agent_settings(slug='vendacertaai'):
-    try:
-        data=json.loads(AGENT_FILE.read_text(encoding='utf-8')) if AGENT_FILE.exists() else {}
-        current=data.get(slug,{})
-        if isinstance(current,dict):
-            return {**DEFAULT_AGENT_SETTINGS,**current}
-    except Exception:
-        pass
-    return DEFAULT_AGENT_SETTINGS.copy()
+    data=load_json(AGENT_FILE,{})
+    current=data.get(str(slug),{}) if isinstance(data,dict) else {}
+    return {**DEFAULT_AGENT_SETTINGS,**current} if isinstance(current,dict) else DEFAULT_AGENT_SETTINGS.copy()
 
 
 def save_agent_settings(slug, settings):
-    data={}
-    try:
-        data=json.loads(AGENT_FILE.read_text(encoding='utf-8')) if AGENT_FILE.exists() else {}
-    except Exception:
-        data={}
-    data[slug]=settings
-    AGENT_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    with DATA_LOCK:
+        data=load_json(AGENT_FILE,{})
+        if not isinstance(data,dict): data={}
+        data[str(slug)]=settings
+        atomic_save(AGENT_FILE,data)
 
 
 def customer_profile(slug, session_id):
-    try:
-        data=json.loads(CUSTOMER_FILE.read_text(encoding='utf-8')) if CUSTOMER_FILE.exists() else {}
-        return data.get(slug,{}).get(session_id,{})
-    except Exception:
-        return {}
+    data=load_json(CUSTOMER_FILE,{})
+    profile=data.get(str(slug),{}).get(str(session_id),{}) if isinstance(data,dict) and isinstance(data.get(str(slug),{}),dict) else {}
+    return profile if isinstance(profile,dict) else {}
 
 
 def save_customer_profile(slug, session_id, profile):
-    data={}
-    try:
-        data=json.loads(CUSTOMER_FILE.read_text(encoding='utf-8')) if CUSTOMER_FILE.exists() else {}
-    except Exception:
-        data={}
-    data.setdefault(slug,{})[session_id]=profile
-    CUSTOMER_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    with DATA_LOCK:
+        data=load_json(CUSTOMER_FILE,{})
+        if not isinstance(data,dict): data={}
+        data.setdefault(str(slug),{})[str(session_id)]=profile
+        atomic_save(CUSTOMER_FILE,data)
 
+
+def payment_history():
+    data=load_json(PAYMENT_HISTORY_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+
+def save_payment_record(record):
+    payment_key=str(record.get('payment_id') or record.get('preference_id') or record.get('reference') or '')
+    if not payment_key: return
+    with DATA_LOCK:
+        data=payment_history(); data[payment_key]=record; atomic_save(PAYMENT_HISTORY_FILE,data)
+
+
+def find_payment_record(payment_id='', reference=''):
+    data=payment_history()
+    for record in data.values():
+        if not isinstance(record,dict): continue
+        if payment_id and str(record.get('payment_id',''))==str(payment_id): return record
+        if reference and str(record.get('reference',''))==str(reference): return record
+    return None
+
+
+def plan_payment_valid(payment, plan):
+    try:
+        return str(payment.get('currency_id','BRL')).upper()=='BRL' and abs(float(payment.get('transaction_amount',0))-PLAN_PRICES[plan])<0.01
+    except Exception:
+        return False
+
+
+def clean_product(product):
+    if not isinstance(product,dict): return None
+    name=str(product.get('name','')).strip()[:120]
+    desc=str(product.get('desc',product.get('description',''))).strip()[:1000]
+    price=price_number(product.get('price',''))
+    if not name or price<=0: return None
+    result={'id':str(product.get('id') or secrets.token_hex(8))[:40],'name':name,'desc':desc or 'Produto disponível na loja.','price':f'R$ {price:.2f}'.replace('.',',')}
+    for key in ('category','image','stock'):
+        if key in product:
+            if key=='stock':
+                try: result[key]=max(0,min(100000,int(product[key])))
+                except Exception: result[key]=0
+            else: result[key]=str(product[key]).strip()[:500]
+    return result
+
+
+def catalog_product(slug, item):
+    products=store_products(slug)
+    item_id=str(item.get('product_id','')).strip() if isinstance(item,dict) else ''
+    name=str(item.get('product','')).strip() if isinstance(item,dict) else ''
+    for product in products:
+        if item_id and str(product.get('id',''))==item_id: return product
+        if name and str(product.get('name','')).strip().casefold()==name.casefold(): return product
+    return None
 
 def payment_token(slug):
-    try:
-        data=json.loads(PAYMENT_FILE.read_text(encoding='utf-8')) if PAYMENT_FILE.exists() else {}
-        return str(data.get(slug,{}).get('access_token','')).strip()
-    except Exception:
-        return ''
+    # Access tokens must stay in the platform secret manager/environment, never tenant JSON.
+    return ''
 
 
 def save_payment_token(slug, token):
-    data={}
-    try: data=json.loads(PAYMENT_FILE.read_text(encoding='utf-8')) if PAYMENT_FILE.exists() else {}
-    except Exception: data={}
-    data[slug]={'access_token':token,'updated_at':time.time()}
-    PAYMENT_FILE.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    return False
 
 
 def price_number(value):
@@ -216,21 +305,35 @@ def payment_label(status):
 
 
 def apply_payment_update(payment):
-    reference=str(payment.get('external_reference','')); status=str(payment.get('status',''))
+    if not isinstance(payment,dict): return False
+    reference=str(payment.get('external_reference','')).strip(); status=str(payment.get('status','')).lower()
+    payment_id=str(payment.get('id','')).strip()
     if reference.startswith('PLAN|'):
-        parts=reference.split('|'); email=parts[1] if len(parts)>1 else ''; plan=parts[2] if len(parts)>2 else ''
-        if status!='approved' or plan not in PLAN_DAYS: return False
+        parts=reference.split('|')
+        email=parts[1].lower() if len(parts)>1 else ''
+        plan=parts[2].upper() if len(parts)>2 else ''
+        if not email or plan not in PLAN_DAYS or not payment_id: return False
+        record=find_payment_record(payment_id,reference)
+        if not plan_payment_valid(payment,plan):
+            if record:
+                record.update({'status':status,'updated_at':time.time(),'validation':'amount_or_currency_mismatch'}); save_payment_record(record)
+            return False
+        record=record or {'reference':reference,'email':email,'plan':plan,'amount':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'created_at':time.time()}
+        record.update({'payment_id':payment_id,'status':status,'payment_status':status,'updated_at':time.time()})
+        if status!='approved':
+            save_payment_record(record); return False
         data=auth_data(); user=data['users'].get(email)
-        if not user: return False
-        payment_id=str(payment.get('id',''))
-        if payment_id and payment_id==str(user.get('last_payment_id','')): return True
-        now=time.time(); start=max(now,float(user.get('access_until',0) or 0)); user['access_plan']=plan; user['access_until']=start+PLAN_DAYS[plan]*86400; user['plan_status']='active'; user['last_payment_id']=payment_id; user['last_payment_at']=now; save_auth(data); return True
+        if not user: record['validation']='account_not_found'; save_payment_record(record); return False
+        if str(user.get('last_payment_id',''))==payment_id or record.get('activated_at'):
+            save_payment_record(record); return True
+        now=time.time(); start=max(now,float(user.get('access_until',0) or 0)); user['access_plan']=plan; user['access_until']=start+PLAN_DAYS[plan]*86400; user['plan_status']='active'; user['last_payment_id']=payment_id; user['last_payment_at']=now; user['payment_history_count']=int(user.get('payment_history_count',0) or 0)+1
+        save_auth(data); record['activated_at']=now; record['activation_until']=user['access_until']; save_payment_record(record); audit_event(user.get('slug',''), 'plan_activated', {'plan':plan,'payment_id':payment_id,'days':PLAN_DAYS[plan]}); return True
     if ':' not in reference: return False
     slug,order_id=reference.split(':',1); orders=store_orders(slug); changed=False
     for order in orders:
         if str(order.get('id'))==order_id:
-            order['status']=payment_label(status); order['payment_id']=str(payment.get('id','')); order['payment_status']=status; order['updated_at']=time.time(); changed=True
-    if changed: save_store_orders(slug,orders)
+            order['status']=payment_label(status); order['payment_id']=payment_id; order['payment_status']=status; order['updated_at']=time.time(); changed=True
+    if changed: save_store_orders(slug,orders); audit_event(slug,'order_payment_updated',{'order_id':order_id,'payment_id':payment_id,'status':status})
     return changed
 
 
@@ -245,22 +348,29 @@ def user_by_slug(slug):
 
 
 def store_access_active(slug):
+    slug=str(slug).strip()
     user=user_by_slug(slug)
-    return True if not user else not access_status(user)['locked']
+    # The built-in demo store is public; every other tenant must exist and be active.
+    return True if slug=='vendacertaai' and not user else bool(user and not access_status(user)['locked'])
 
 
 def verify_mp_webhook(handler, body):
     secret=os.environ.get('MERCADO_PAGO_WEBHOOK_SECRET','').strip()
-    if not secret: return True
+    if not secret: return True  # Signature verification becomes mandatory as soon as MP secret is configured.
     signature=handler.headers.get('x-signature',''); request_id=handler.headers.get('x-request-id','')
-    query=parse_qs(urlparse(handler.path).query); data_id=(query.get('data.id') or [''])[0]
+    query=parse_qs(urlparse(handler.path).query)
+    data_id=(query.get('data.id') or query.get('id') or [''])[0]
     if not data_id and isinstance(body.get('data'),dict): data_id=str(body['data'].get('id',''))
     values={}
     for part in signature.split(','):
         if '=' in part:
-            k,v=part.strip().split('=',1); values[k]=v
+            k,v=part.strip().split('=',1); values[k.strip()]=v.strip()
     ts=values.get('ts',''); received=values.get('v1','')
     if not ts or not received or not request_id or not data_id: return False
+    try:
+        tolerance=int(os.environ.get('MERCADO_PAGO_WEBHOOK_TOLERANCE_SECONDS','300'))
+        if abs(time.time()-int(ts))>max(30,min(tolerance,3600)): return False
+    except Exception: return False
     manifest='id:'+data_id+';request-id:'+request_id+';ts:'+ts+';'
     expected=hmac.new(secret.encode(),manifest.encode(),hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected,received)
@@ -394,7 +504,7 @@ def vendacerta_files():
 :root{--navy:#0f172a;--navy-soft:#172554;--purple:#6d5df5;--mint:#5eead4;--cyan:#22d3ee;--ice:#f5f7fa;--ink:#111827;--muted:#64748b;--line:#e2e8f0;--glass:rgba(255,255,255,.76)}
 body{background:var(--ice);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:-.01em}header{height:74px;padding:0 6%;gap:16px;background:rgba(255,255,255,.82);border-bottom:1px solid rgba(148,163,184,.22);box-shadow:0 8px 30px rgba(15,23,42,.05);backdrop-filter:blur(18px);position:sticky;top:0;z-index:4}.logo{color:var(--navy);font-size:19px;letter-spacing:-.04em}.logo span{background:linear-gradient(100deg,var(--purple),var(--cyan));background-clip:text;color:transparent}header nav{gap:8px}header nav button,.adm-link{color:#64748b;border-radius:10px;padding:9px 12px;transition:.2s}header nav button:hover{color:var(--navy);background:#eef2ff}.outline{border:1px solid #cbd5e1;background:rgba(255,255,255,.6);color:var(--navy);border-radius:10px;padding:10px 15px;transition:.2s}.outline:hover{border-color:var(--purple);box-shadow:0 8px 18px rgba(109,93,245,.14)}.primary{background:linear-gradient(110deg,var(--purple),#8b5cf6);border-radius:11px;padding:11px 16px;box-shadow:0 10px 24px rgba(109,93,245,.2);transition:transform .2s,box-shadow .2s}.primary:hover{transform:translateY(-2px);box-shadow:0 14px 28px rgba(109,93,245,.3)}.theme-btn{border:1px solid #cbd5e1;background:#fff;color:var(--navy);width:36px;height:36px;border-radius:10px;font-size:17px}.account-badge{color:var(--purple);font-weight:700}.view{max-width:1240px;padding:64px 6%}.hero{min-height:590px;border-radius:0 0 32px 32px;padding:72px 7%;background:radial-gradient(circle at 80% 25%,rgba(109,93,245,.18),transparent 28%),radial-gradient(circle at 68% 70%,rgba(34,211,238,.12),transparent 24%)}.hero h1{font-size:clamp(46px,7vw,82px);color:var(--navy);letter-spacing:-.07em}.hero em{background:linear-gradient(100deg,var(--purple),#0891b2);background-clip:text}.hero p,.section-head p,.muted{color:var(--muted)}small{color:#6256d9;letter-spacing:1.4px}.section-head{align-items:center}.section-head h2{color:var(--navy);letter-spacing:-.04em}.products{gap:20px}.product{background:var(--glass);border:1px solid rgba(148,163,184,.3);border-radius:20px;box-shadow:0 14px 35px rgba(15,23,42,.07);backdrop-filter:blur(14px);transition:transform .25s,box-shadow .25s}.product:hover{transform:translateY(-5px);box-shadow:0 20px 42px rgba(15,23,42,.13)}.product-art{height:170px;background:linear-gradient(135deg,#c7d2fe,#ddd6fe 48%,#bae6fd)}.product:nth-child(2) .product-art{background:linear-gradient(135deg,#cffafe,#99f6e4)}.product:nth-child(3) .product-art{background:linear-gradient(135deg,#e0e7ff,#f5d0fe)}.product-info{padding:18px}.product-info strong{color:var(--navy);font-size:15px}.product-info p{color:var(--muted);line-height:1.5}.product-info .price{color:var(--purple);font-size:17px}.product-info .actions{margin-top:14px}.product-info .actions .outline{padding:8px 11px;font-size:12px}.assistant-box,.access-card{background:rgba(255,255,255,.76);border:1px solid rgba(148,163,184,.3);box-shadow:0 20px 50px rgba(15,23,42,.08);backdrop-filter:blur(18px);border-radius:24px}.ai-identity{display:flex;align-items:center;gap:14px}.ai-identity h2{margin:4px 0;color:var(--navy);letter-spacing:-.04em}.ai-identity p{color:var(--muted);font-size:12px;margin:0}.ai-avatar{width:52px;height:52px;border-radius:17px;display:grid;place-items:center;color:#fff;font-size:25px;background:linear-gradient(135deg,var(--purple),var(--cyan));box-shadow:0 10px 24px rgba(109,93,245,.28)}.chat{background:rgba(241,245,249,.8);border:1px solid var(--line)}.bubble.ai{background:#e0e7ff;color:#1e1b4b;border-radius:14px}.bubble.user{background:var(--navy);border-radius:14px}.status{margin-left:auto;color:#059669}.chat input{background:#fff;border:1px solid var(--line);color:var(--ink)}.admin-grid>div,.code-list>div{background:rgba(255,255,255,.78);border-color:var(--line);border-radius:14px}.admin-grid strong{color:var(--navy)}.modal-card{background:rgba(255,255,255,.94);color:var(--ink);border:1px solid #cbd5e1;border-radius:20px;box-shadow:0 24px 80px rgba(15,23,42,.2)}.modal-card input{background:#f8fafc;border-color:#cbd5e1;color:var(--ink);border-radius:10px}.close{color:var(--muted)}.toast{background:var(--navy);border-color:var(--purple);border-radius:12px}.dark{background:#111827;color:#e5e7eb}.dark header{background:rgba(17,24,39,.84);border-color:#293548}.dark .logo,.dark .section-head h2,.dark .hero h1,.dark .product-info strong,.dark .ai-identity h2{color:#f8fafc}.dark .view{color:#e5e7eb}.dark .product,.dark .assistant-box,.dark .access-card,.dark .admin-grid>div,.dark .code-list>div,.dark .modal-card{background:rgba(31,41,55,.82);border-color:#374151}.dark .product-info p,.dark .section-head p,.dark .muted,.dark .ai-identity p{color:#94a3b8}.dark .chat{background:#111827;border-color:#374151}.dark .chat input{background:#1f2937;border-color:#475569;color:#fff}.dark .bubble.ai{background:#312e81;color:#e0e7ff}.dark .theme-btn,.dark .outline{background:#1f2937;border-color:#475569;color:#e2e8f0}@media(max-width:700px){header{height:64px;padding:0 14px;gap:8px}.account-badge{display:none}.theme-btn{width:32px;height:32px}.back-btn{padding:7px 9px;font-size:11px}.hero{border-radius:0;padding:48px 22px}.view{padding:38px 18px}.ai-identity{align-items:flex-start}.status{font-size:10px}}
 '''
-    js=r'''let products=[{name:'Produto especial',desc:'Qualidade e estilo para você.',price:'R$ 49,90'},{name:'Mais vendido',desc:'O favorito dos clientes.',price:'R$ 79,90'},{name:'Novidade',desc:'Acabou de chegar na loja.',price:'R$ 99,90'}];let orders=[];let authUser=null;let storeSlug=new URLSearchParams(window.location.search).get('loja')||'vendacertaai';let customerSession=localStorage.getItem('vc_customer_session_'+storeSlug)||('c_'+Date.now()+'_'+Math.random().toString(36).slice(2));localStorage.setItem('vc_customer_session_'+storeSlug,customerSession);let currentView='home';let screenHistory=['home'];const $=id=>document.getElementById(id);function view(id,record=true){if((id==='productsView'||id==='orders')&&!authUser){openLogin();toast('Entre para acessar sua área de gestão.');return}if(!$(id)||id===currentView)return;document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));$(id).classList.add('active');if(record)screenHistory.push(id);currentView=id;window.scrollTo(0,0)}function toast(t){$('toast').textContent=t;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),2500)}function modal(html){$('modalBody').innerHTML=html;$('modal').classList.add('open')}function dismissModal(){ $('modal').classList.remove('open') }function renderProducts(){const html=products.map((p,i)=>`<article class="product"><div class="product-art"></div><div class="product-info"><strong>${p.name}</strong><p>${p.desc}</p><div class="price">${p.price}</div><button class="primary" data-buy="${i}">Adicionar ao pedido</button></div></article>`).join('');$('products').innerHTML=html;$('productsAdmin').innerHTML=products.map((p,i)=>`<article class="product"><div class="product-art"></div><div class="product-info"><strong>${p.name}</strong><p>${p.desc}</p><div class="price">${p.price}</div><div class="actions"><button class="outline" data-edit="${i}">Editar</button><button class="outline" data-delete="${i}">Excluir</button></div></div></article>`).join('');document.querySelectorAll('[data-buy]').forEach(b=>b.onclick=async()=>{const chosen=products[Number(b.dataset.buy)],order={id:String(Date.now()).slice(-6),product:chosen.name,price:chosen.price,status:'Novo'};if(authUser){orders.push(order);syncOrders();view('orders');renderOrders();toast('Pedido criado com sucesso')}else{const saved=JSON.parse(localStorage.getItem('vc_customer_profile_'+storeSlug)||'{}');modal('<small>FINALIZAR PEDIDO</small><h2>Como podemos te identificar?</h2><p class="muted">Precisamos destes dados para a loja acompanhar seu pedido.</p><input id="customerName" placeholder="Seu nome"><input id="customerPhone" placeholder="Seu telefone"><button class="primary" id="customerSubmit">Enviar pedido</button>');setTimeout(()=>{$('customerName').value=saved.name||'';$('customerPhone').value=saved.phone||'';$('customerSubmit').onclick=async()=>{const name=$('customerName').value.trim(),phone=$('customerPhone').value.trim();if(!name||!phone){toast('Informe nome e telefone');return}try{const r=await fetch('/api/payment/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,session_id:customerSession,customer:{name,phone},order})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Não foi possível criar o pagamento.');localStorage.setItem('vc_customer_profile_'+storeSlug,JSON.stringify({name,phone}));dismissModal();window.location.href=d.checkout_url}catch(e){toast('Não foi possível enviar o pedido agora.')}}},0)}});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.edit),p=products[i];modal('<small>EDITAR PRODUTO</small><h2>Atualizar produto</h2><input id="editName" placeholder="Nome do produto"><input id="editDesc" placeholder="Descrição"><input id="editPrice" placeholder="Preço"><button class="primary" id="updateProduct">Salvar alterações</button>');setTimeout(()=>{$('editName').value=p.name;$('editDesc').value=p.desc;$('editPrice').value=p.price;$('updateProduct').onclick=()=>{const name=$('editName').value.trim(),desc=$('editDesc').value.trim(),price=$('editPrice').value.trim();if(!name||!price){toast('Informe nome e preço');return}products[i]={name,desc:desc||'Produto disponível na loja.',price};syncProducts();renderProducts();dismissModal();toast('Produto atualizado!')}},0)});document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.delete);modal('<small>EXCLUIR PRODUTO</small><h2>Tem certeza?</h2><p class="muted">Este produto será removido da loja.</p><button class="primary" id="confirmDelete">Excluir produto</button>');setTimeout(()=>{$('confirmDelete').onclick=()=>{products.splice(i,1);if(!products.length)products.push({name:'Novo produto',desc:'Adicione uma descrição.',price:'R$ 0,00'});syncProducts();renderProducts();dismissModal();toast('Produto excluído!')}},0)});};function syncProducts(){localStorage.setItem('vendacerta_products',JSON.stringify(products));fetch('/api/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,products})}).catch(()=>{})}function renderOrders(){if(!orders.length){$('ordersList').innerHTML='<div class="empty">Nenhum pedido ainda. Os pedidos dos clientes aparecerão aqui.</div>';return}$('ordersList').innerHTML=orders.map(o=>'<div class="product"><div class="product-info"><strong>Pedido '+o.id+'</strong><p>'+safeText(o.product)+' · 1 unidade</p><div class="price">'+safeText(o.price)+'</div><span class="muted">Cliente: '+safeText(o.customer_name||'Não informado')+(o.customer_phone?' · '+safeText(o.customer_phone):'')+'<br>Status: '+safeText(o.status||'Novo')+'</span></div></div>').join('')}function syncOrders(){localStorage.setItem('vendacerta_orders',JSON.stringify(orders));fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,orders})}).catch(()=>{})}async function loadProducts(){try{const r=await fetch('/api/store?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.products?.length){products=d.products;renderProducts()}}catch(e){}}async function loadOrders(){if(!authUser){orders=[];renderOrders();return}try{const r=await fetch('/api/orders?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(Array.isArray(d.orders)){orders=d.orders;renderOrders()}}catch(e){}}async function loadMarketplaceSummary(){if(!authUser)return;try{const r=await fetch('/api/marketplace/summary?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.ok){const s=d.summary;$('marketplaceSummary').innerHTML='<div><small>VENDAS PAGAS</small><strong>R$ '+Number(s.gross_sales||0).toFixed(2).replace('.',',')+'</strong></div><div><small>SUA COMISSÃO ESTIMADA</small><strong>R$ '+Number(s.platform_commission||0).toFixed(2).replace('.',',')+'</strong></div><div><small>REPASSE ESTIMADO</small><strong>R$ '+Number(s.seller_net_estimate||0).toFixed(2).replace('.',',')+'</strong></div>'}}catch(e){}}async function loadAccessStatus(){if(!authUser)return;try{const r=await fetch('/api/access/status');const d=await r.json();if(!d.ok)return;const a=d.access;if(a.locked){$('planAccessBtn').style.display='inline-block';$('accessTitle').textContent='Seu teste terminou';if(currentView!=='access')view('access',false);$('accessMessage').textContent='Escolha um plano para continuar usando a VendaCertaAI.';$('accessTimer').style.display='none';$('planOptions').style.display='block'}else{$('planAccessBtn').style.display='none';$('accessTitle').textContent=a.plan_active?'Acesso '+(a.plan||'ativo'):'Teste grátis ativo';$('accessMessage').textContent=a.plan_active?'Seu acesso está ativo.':'Você tem 48 horas para testar a VendaCertaAI.'}}catch(e){}}async function checkSession(){try{const r=await fetch('/api/auth/me');const d=await r.json();if(d.ok&&d.user){storeSlug=d.user.slug;setAuth(d.user);window.history.replaceState({},'',window.location.pathname+'?loja='+encodeURIComponent(storeSlug));loadProducts();loadOrders();loadMarketplaceSummary();loadAgentSettings()}}catch(e){}}document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>view(b.dataset.view));async function authPost(route,payload){const r=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw new Error(d.error||'Não foi possível concluir.');return d}function setAuth(user){authUser=user;$('accountBadge').textContent=user?'Olá, '+user.name:'';$('headerLogin').textContent=user?'Sair':'Entrar';$('headerLogin').onclick=user?logout:openLogin;$('agentControls').classList.toggle('visible',!!user);if(user){loadAgentSettings();loadAccessStatus()}}async function loadAgentSettings(){if(!authUser)return;try{const r=await fetch('/api/agent/settings?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.ok){$('minMargin').value=d.settings.min_margin;$('maxDiscount').value=d.settings.max_discount;$('approvalRequired').checked=!!d.settings.require_approval;$('agentTone').value=d.settings.tone}}catch(e){}}async function saveAgentSettings(){try{const payload={slug:storeSlug,settings:{min_margin:Number($('minMargin').value),max_discount:Number($('maxDiscount').value),require_approval:$('approvalRequired').checked,tone:$('agentTone').value}};const d=await authPost('/api/agent/settings',payload);$('agentSettingsStatus').textContent='Regras salvas';setTimeout(()=>$('agentSettingsStatus').textContent='',2500);toast('Regras da IA atualizadas!')}catch(e){toast(e.message)}}function enterStore(user,message){storeSlug=user.slug;setAuth(user);window.history.replaceState({},'',window.location.pathname+'?loja='+encodeURIComponent(storeSlug));dismissModal();view('store');loadProducts();loadOrders();loadMarketplaceSummary();loadAgentSettings();toast(message)}async function logout(){await fetch('/api/auth/logout',{method:'POST'});setAuth(null);view('home');toast('Você saiu da conta.')}function openSignup(){modal('<small>TESTE GRÁTIS</small><h2>Comece em 48 horas</h2><input id="signupName" placeholder="Seu nome"><input id="signupBusiness" placeholder="Nome do negócio"><input id="signupEmail" placeholder="Seu e-mail" type="email"><input id="signupPassword" placeholder="Crie uma senha (mín. 6 caracteres)" type="password"><button class="primary" id="signupSubmit">Criar minha conta</button>');setTimeout(()=>{$('signupSubmit').onclick=async()=>{try{const d=await authPost('/api/auth/signup',{name:$('signupName').value,business:$('signupBusiness').value,email:$('signupEmail').value,password:$('signupPassword').value});enterStore(d.user,'Teste grátis iniciado!')}catch(e){toast(e.message)} }},0)}function openLogin(){modal('<small>ENTRAR</small><h2>Acesse sua conta</h2><input id="loginEmail" placeholder="E-mail" type="email"><input id="loginPassword" placeholder="Senha" type="password"><button class="primary" id="loginSubmit">Entrar</button>');setTimeout(()=>{$('loginSubmit').onclick=async()=>{try{const d=await authPost('/api/auth/login',{email:$('loginEmail').value,password:$('loginPassword').value});enterStore(d.user,'Login realizado!')}catch(e){toast(e.message)} }},0)}$('trialBtn').onclick=openSignup;$('loginBtn').onclick=$('headerLogin').onclick=openLogin;$('planAccessBtn').onclick=()=>view('access');document.querySelectorAll('[data-plan]').forEach(b=>b.onclick=async()=>{try{const d=await authPost('/api/access/checkout',{plan:b.dataset.plan});if(d.checkout_url)window.location.href=d.checkout_url;else toast('Checkout indisponível.')}catch(e){toast(e.message)}});$('admBtn').onclick=()=>{modal('<small>ÁREA RESTRITA</small><h2>Senha do ADM</h2><input id="admPassword" type="password" placeholder="Digite a senha"><button class="primary" id="admLogin">Acessar ADM</button>');setTimeout(()=>{$('admLogin').onclick=()=>{if($('admPassword').value==='muriloadm321'){dismissModal();view('admin')}else toast('Senha incorreta')}},0)};function storeLink(){return window.location.origin+window.location.pathname+'?loja='+encodeURIComponent(storeSlug)}$('shareStore').onclick=()=>{const link=storeLink();modal('<small>LINK DA LOJA PÚBLICA</small><h2>Compartilhe sua loja</h2><p class="muted">Envie este link para seus clientes verem os produtos:</p><input id="storeLink" value="'+link+'" readonly><button class="primary" id="copyStore">Copiar link</button><button class="outline" onclick="window.open(\''+link+'\',\'_blank\')">Abrir loja pública</button>');setTimeout(()=>{$('copyStore').onclick=()=>{navigator.clipboard?.writeText(link);toast('Link copiado!');dismissModal()}},0)};$('openChat').onclick=()=>view('assistant');$('codeBtn').onclick=()=>modal('<small>CÓDIGO DE ACESSO</small><h2>Digite seu código</h2><input placeholder="Ex.: PRO-2026-XXXX"><button class="primary" onclick="dismissModal();toast(\'Código validado! Acesso liberado.\')">Liberar acesso</button>');$('newCode').onclick=()=>{modal('<small>NOVO CÓDIGO</small><h2>Escolha o plano</h2><select id="planSelect"><option value="BASICO">Básico · 30 dias</option><option value="PRO">Pro · 180 dias</option><option value="ENTERPRISE">Enterprise · 365 dias</option></select><button class="primary" id="createCode">Gerar código</button>');setTimeout(()=>{$('createCode').onclick=()=>{const p=$('planSelect').value;const labels={BASICO:'BÁSICO',PRO:'PRO',ENTERPRISE:'ENTERPRISE'};const days={BASICO:30,PRO:180,ENTERPRISE:365};const code=p+'-'+Math.random().toString(36).slice(2,8).toUpperCase();modal('<small>'+labels[p]+' · '+days[p]+' dias</small><h2>Código criado</h2><p class="muted">Entregue este código ao empreendedor:</p><div class="timer">'+code+'</div><button class="primary" onclick="dismissModal()">Fechar</button>')}} ,0)};$('addProduct').onclick=()=>{modal('<small>NOVO PRODUTO</small><h2>Adicionar produto</h2><input id="productName" placeholder="Nome do produto"><input id="productDesc" placeholder="Descrição"><input id="productPrice" placeholder="Preço"><button class="primary" id="saveProduct">Salvar produto</button>');setTimeout(()=>{$('saveProduct').onclick=()=>{const name=$('productName').value.trim(),desc=$('productDesc').value.trim(),price=$('productPrice').value.trim();if(!name||!price){toast('Informe nome e preço');return}products.push({name,desc:desc||'Produto disponível na loja.',price});syncProducts();renderProducts();dismissModal();toast('Produto salvo e catálogo atualizado!')}},0)};function safeText(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}$('chatForm').onsubmit=async e=>{e.preventDefault();const i=$('chatInput');if(!i.value.trim())return;const t=i.value.trim();const c=$('chat');c.innerHTML+='<div class="bubble user">'+safeText(t)+'</div>';i.value='';c.innerHTML+='<div class="bubble ai" id="typing">Estou consultando os produtos...</div>';c.scrollTop=c.scrollHeight;try{const r=await fetch('/api/seller-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t,catalog:products,slug:storeSlug,session_id:customerSession})});const d=await r.json();$('typing')?.remove();c.innerHTML+='<div class="bubble ai">'+safeText(d.reply||'Não consegui responder agora.')+'</div>'}catch(err){$('typing')?.remove();c.innerHTML+='<div class="bubble ai">Não consegui falar com a vendedora agora. Tente novamente.</div>'}c.scrollTop=c.scrollHeight};$('themeBtn').onclick=()=>{document.body.classList.toggle('dark');localStorage.setItem('vc_theme',document.body.classList.contains('dark')?'dark':'light')};$('saveAgentSettings').onclick=saveAgentSettings;if(localStorage.getItem('vc_theme')==='dark')document.body.classList.add('dark');$('backBtn').onclick=()=>{if(screenHistory.length>1){screenHistory.pop();view(screenHistory[screenHistory.length-1],false)}};$('closeModal').onclick=dismissModal;renderProducts();renderOrders();loadProducts();loadOrders();checkSession();const paymentQuery=new URLSearchParams(window.location.search),paymentResult=paymentQuery.get('payment'),returnedPayment=paymentQuery.get('payment_id');if(returnedPayment)fetch('/api/payment/status?id='+encodeURIComponent(returnedPayment)).then(r=>r.json()).then(d=>{if(d.ok)toast('Status do pagamento: '+d.label)}).catch(()=>{});if(paymentResult==='success')setTimeout(()=>toast('Pagamento aprovado! Pedido recebido pela loja.'),700);if(paymentResult==='pending')setTimeout(()=>toast('Pagamento em análise. A loja acompanhará o status.'),700);if(paymentResult==='failure')setTimeout(()=>toast('Pagamento não concluído. Você pode tentar novamente.'),700);if(new URLSearchParams(window.location.search).has('loja')){view('store')}'''
+    js=r'''let products=[{name:'Produto especial',desc:'Qualidade e estilo para você.',price:'R$ 49,90'},{name:'Mais vendido',desc:'O favorito dos clientes.',price:'R$ 79,90'},{name:'Novidade',desc:'Acabou de chegar na loja.',price:'R$ 99,90'}];let orders=[];let authUser=null;let storeSlug=new URLSearchParams(window.location.search).get('loja')||'vendacertaai';let customerSession=localStorage.getItem('vc_customer_session_'+storeSlug)||('c_'+Date.now()+'_'+Math.random().toString(36).slice(2));localStorage.setItem('vc_customer_session_'+storeSlug,customerSession);let currentView='home';let screenHistory=['home'];const $=id=>document.getElementById(id);function view(id,record=true){if((id==='productsView'||id==='orders')&&!authUser){openLogin();toast('Entre para acessar sua área de gestão.');return}if(!$(id)||id===currentView)return;document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));$(id).classList.add('active');if(record)screenHistory.push(id);currentView=id;window.scrollTo(0,0)}function toast(t){$('toast').textContent=t;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),2500)}function modal(html){$('modalBody').innerHTML=html;$('modal').classList.add('open')}function dismissModal(){ $('modal').classList.remove('open') }function renderProducts(){const html=products.map((p,i)=>`<article class="product"><div class="product-art"></div><div class="product-info"><strong>${safeText(p.name)}</strong><p>${safeText(p.desc)}</p><div class="price">${safeText(p.price)}</div><button class="primary" data-buy="${i}">Adicionar ao pedido</button></div></article>`).join('');$('products').innerHTML=html;$('productsAdmin').innerHTML=products.map((p,i)=>`<article class="product"><div class="product-art"></div><div class="product-info"><strong>${safeText(p.name)}</strong><p>${safeText(p.desc)}</p><div class="price">${safeText(p.price)}</div><div class="actions"><button class="outline" data-edit="${i}">Editar</button><button class="outline" data-delete="${i}">Excluir</button></div></div></article>`).join('');document.querySelectorAll('[data-buy]').forEach(b=>b.onclick=async()=>{const chosen=products[Number(b.dataset.buy)],order={id:String(Date.now()).slice(-6),product:chosen.name,price:chosen.price,status:'Novo'};if(authUser){orders.push(order);syncOrders();view('orders');renderOrders();toast('Pedido criado com sucesso')}else{const saved=JSON.parse(localStorage.getItem('vc_customer_profile_'+storeSlug)||'{}');modal('<small>FINALIZAR PEDIDO</small><h2>Como podemos te identificar?</h2><p class="muted">Precisamos destes dados para a loja acompanhar seu pedido.</p><input id="customerName" placeholder="Seu nome"><input id="customerPhone" placeholder="Seu telefone"><button class="primary" id="customerSubmit">Enviar pedido</button>');setTimeout(()=>{$('customerName').value=saved.name||'';$('customerPhone').value=saved.phone||'';$('customerSubmit').onclick=async()=>{const name=$('customerName').value.trim(),phone=$('customerPhone').value.trim();if(!name||!phone){toast('Informe nome e telefone');return}try{const r=await fetch('/api/payment/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,session_id:customerSession,customer:{name,phone},order})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Não foi possível criar o pagamento.');localStorage.setItem('vc_customer_profile_'+storeSlug,JSON.stringify({name,phone}));dismissModal();window.location.href=d.checkout_url}catch(e){toast('Não foi possível enviar o pedido agora.')}}},0)}});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.edit),p=products[i];modal('<small>EDITAR PRODUTO</small><h2>Atualizar produto</h2><input id="editName" placeholder="Nome do produto"><input id="editDesc" placeholder="Descrição"><input id="editPrice" placeholder="Preço"><button class="primary" id="updateProduct">Salvar alterações</button>');setTimeout(()=>{$('editName').value=p.name;$('editDesc').value=p.desc;$('editPrice').value=p.price;$('updateProduct').onclick=()=>{const name=$('editName').value.trim(),desc=$('editDesc').value.trim(),price=$('editPrice').value.trim();if(!name||!price){toast('Informe nome e preço');return}products[i]={name,desc:desc||'Produto disponível na loja.',price};syncProducts();renderProducts();dismissModal();toast('Produto atualizado!')}},0)});document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>{const i=Number(b.dataset.delete);modal('<small>EXCLUIR PRODUTO</small><h2>Tem certeza?</h2><p class="muted">Este produto será removido da loja.</p><button class="primary" id="confirmDelete">Excluir produto</button>');setTimeout(()=>{$('confirmDelete').onclick=()=>{products.splice(i,1);if(!products.length)products.push({name:'Novo produto',desc:'Adicione uma descrição.',price:'R$ 0,00'});syncProducts();renderProducts();dismissModal();toast('Produto excluído!')}},0)});};function syncProducts(){localStorage.setItem('vendacerta_products',JSON.stringify(products));fetch('/api/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,products})}).catch(()=>{})}function renderOrders(){if(!orders.length){$('ordersList').innerHTML='<div class="empty">Nenhum pedido ainda. Os pedidos dos clientes aparecerão aqui.</div>';return}$('ordersList').innerHTML=orders.map(o=>'<div class="product"><div class="product-info"><strong>Pedido '+o.id+'</strong><p>'+safeText(o.product)+' · 1 unidade</p><div class="price">'+safeText(o.price)+'</div><span class="muted">Cliente: '+safeText(o.customer_name||'Não informado')+(o.customer_phone?' · '+safeText(o.customer_phone):'')+'<br>Status: '+safeText(o.status||'Novo')+'</span></div></div>').join('')}function syncOrders(){localStorage.setItem('vendacerta_orders',JSON.stringify(orders));fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:storeSlug,orders})}).catch(()=>{})}async function loadProducts(){try{const r=await fetch('/api/store?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.products?.length){products=d.products;renderProducts()}}catch(e){}}async function loadOrders(){if(!authUser){orders=[];renderOrders();return}try{const r=await fetch('/api/orders?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(Array.isArray(d.orders)){orders=d.orders;renderOrders()}}catch(e){}}async function loadMarketplaceSummary(){if(!authUser)return;try{const r=await fetch('/api/marketplace/summary?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.ok){const s=d.summary;$('marketplaceSummary').innerHTML='<div><small>VENDAS PAGAS</small><strong>R$ '+Number(s.gross_sales||0).toFixed(2).replace('.',',')+'</strong></div><div><small>SUA COMISSÃO ESTIMADA</small><strong>R$ '+Number(s.platform_commission||0).toFixed(2).replace('.',',')+'</strong></div><div><small>REPASSE ESTIMADO</small><strong>R$ '+Number(s.seller_net_estimate||0).toFixed(2).replace('.',',')+'</strong></div>'}}catch(e){}}async function loadAccessStatus(){if(!authUser)return;try{const r=await fetch('/api/access/status');const d=await r.json();if(!d.ok)return;const a=d.access;if(a.locked){$('planAccessBtn').style.display='inline-block';$('accessTitle').textContent='Seu teste terminou';if(currentView!=='access')view('access',false);$('accessMessage').textContent='Escolha um plano para continuar usando a VendaCertaAI.';$('accessTimer').style.display='none';$('planOptions').style.display='block'}else{$('planAccessBtn').style.display='none';$('accessTitle').textContent=a.plan_active?'Acesso '+(a.plan||'ativo'):'Teste grátis ativo';$('accessMessage').textContent=a.plan_active?'Seu acesso está ativo.':'Você tem 48 horas para testar a VendaCertaAI.'}}catch(e){}}async function checkSession(){try{const r=await fetch('/api/auth/me');const d=await r.json();if(d.ok&&d.user){storeSlug=d.user.slug;setAuth(d.user);window.history.replaceState({},'',window.location.pathname+'?loja='+encodeURIComponent(storeSlug));loadProducts();loadOrders();loadMarketplaceSummary();loadAgentSettings()}}catch(e){}}document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>view(b.dataset.view));async function authPost(route,payload){const r=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw new Error(d.error||'Não foi possível concluir.');return d}function setAuth(user){authUser=user;$('accountBadge').textContent=user?'Olá, '+user.name:'';$('headerLogin').textContent=user?'Sair':'Entrar';$('headerLogin').onclick=user?logout:openLogin;$('agentControls').classList.toggle('visible',!!user);if(user){loadAgentSettings();loadAccessStatus()}}async function loadAgentSettings(){if(!authUser)return;try{const r=await fetch('/api/agent/settings?loja='+encodeURIComponent(storeSlug));const d=await r.json();if(d.ok){$('minMargin').value=d.settings.min_margin;$('maxDiscount').value=d.settings.max_discount;$('approvalRequired').checked=!!d.settings.require_approval;$('agentTone').value=d.settings.tone}}catch(e){}}async function saveAgentSettings(){try{const payload={slug:storeSlug,settings:{min_margin:Number($('minMargin').value),max_discount:Number($('maxDiscount').value),require_approval:$('approvalRequired').checked,tone:$('agentTone').value}};const d=await authPost('/api/agent/settings',payload);$('agentSettingsStatus').textContent='Regras salvas';setTimeout(()=>$('agentSettingsStatus').textContent='',2500);toast('Regras da IA atualizadas!')}catch(e){toast(e.message)}}function enterStore(user,message){storeSlug=user.slug;setAuth(user);window.history.replaceState({},'',window.location.pathname+'?loja='+encodeURIComponent(storeSlug));dismissModal();view('store');loadProducts();loadOrders();loadMarketplaceSummary();loadAgentSettings();toast(message)}async function logout(){await fetch('/api/auth/logout',{method:'POST'});setAuth(null);view('home');toast('Você saiu da conta.')}function openSignup(){modal('<small>TESTE GRÁTIS</small><h2>Comece em 48 horas</h2><input id="signupName" placeholder="Seu nome"><input id="signupBusiness" placeholder="Nome do negócio"><input id="signupEmail" placeholder="Seu e-mail" type="email"><input id="signupPassword" placeholder="Crie uma senha (mín. 6 caracteres)" type="password"><button class="primary" id="signupSubmit">Criar minha conta</button>');setTimeout(()=>{$('signupSubmit').onclick=async()=>{try{const d=await authPost('/api/auth/signup',{name:$('signupName').value,business:$('signupBusiness').value,email:$('signupEmail').value,password:$('signupPassword').value});enterStore(d.user,'Teste grátis iniciado!')}catch(e){toast(e.message)} }},0)}function openLogin(){modal('<small>ENTRAR</small><h2>Acesse sua conta</h2><input id="loginEmail" placeholder="E-mail" type="email"><input id="loginPassword" placeholder="Senha" type="password"><button class="primary" id="loginSubmit">Entrar</button>');setTimeout(()=>{$('loginSubmit').onclick=async()=>{try{const d=await authPost('/api/auth/login',{email:$('loginEmail').value,password:$('loginPassword').value});enterStore(d.user,'Login realizado!')}catch(e){toast(e.message)} }},0)}$('trialBtn').onclick=openSignup;$('loginBtn').onclick=$('headerLogin').onclick=openLogin;$('planAccessBtn').onclick=()=>view('access');document.querySelectorAll('[data-plan]').forEach(b=>b.onclick=async()=>{try{const d=await authPost('/api/access/checkout',{plan:b.dataset.plan});if(d.checkout_url)window.location.href=d.checkout_url;else toast('Checkout indisponível.')}catch(e){toast(e.message)}});$('admBtn').onclick=()=>{modal('<small>ÁREA RESTRITA</small><h2>Senha do ADM</h2><input id="admPassword" type="password" placeholder="Digite a senha"><button class="primary" id="admLogin">Acessar ADM</button>');setTimeout(()=>{$('admLogin').onclick=async()=>{try{await authPost('/api/admin/login',{password:$('admPassword').value});dismissModal();view('admin');toast('Sessão ADM iniciada')}catch(e){toast(e.message)}}},0)};function storeLink(){return window.location.origin+window.location.pathname+'?loja='+encodeURIComponent(storeSlug)}$('shareStore').onclick=()=>{const link=storeLink();modal('<small>LINK DA LOJA PÚBLICA</small><h2>Compartilhe sua loja</h2><p class="muted">Envie este link para seus clientes verem os produtos:</p><input id="storeLink" value="'+link+'" readonly><button class="primary" id="copyStore">Copiar link</button><button class="outline" onclick="window.open(\''+link+'\',\'_blank\')">Abrir loja pública</button>');setTimeout(()=>{$('copyStore').onclick=()=>{navigator.clipboard?.writeText(link);toast('Link copiado!');dismissModal()}},0)};$('openChat').onclick=()=>view('assistant');$('codeBtn').onclick=()=>{modal('<small>CÓDIGO DE ACESSO</small><h2>Digite seu código</h2><input id="accessCode" placeholder="Ex.: PRO-2026-XXXX"><button class="primary" id="redeemCode">Liberar acesso</button>');setTimeout(()=>{$('redeemCode').onclick=async()=>{try{await authPost('/api/access/redeem',{code:$('accessCode').value});dismissModal();toast('Código validado! Acesso liberado.');loadAccessStatus()}catch(e){toast(e.message)}}},0)};$('newCode').onclick=()=>{modal('<small>NOVO CÓDIGO</small><h2>Escolha o plano</h2><select id="planSelect"><option value="BASICO">Básico · 30 dias</option><option value="PRO">Pro · 180 dias</option><option value="ENTERPRISE">Enterprise · 365 dias</option></select><button class="primary" id="createCode">Gerar código</button>');setTimeout(()=>{$('createCode').onclick=async()=>{try{const d=await authPost('/api/admin/codes/create',{plan:$('planSelect').value});modal('<small>'+safeText(d.plan)+' · '+d.days+' dias</small><h2>Código criado</h2><p class="muted">Entregue este código ao empreendedor:</p><div class="timer">'+safeText(d.code)+'</div><button class="primary" onclick="dismissModal()">Fechar</button>')}catch(e){toast(e.message)}}},0)};$('addProduct').onclick=()=>{modal('<small>NOVO PRODUTO</small><h2>Adicionar produto</h2><input id="productName" placeholder="Nome do produto"><input id="productDesc" placeholder="Descrição"><input id="productPrice" placeholder="Preço"><button class="primary" id="saveProduct">Salvar produto</button>');setTimeout(()=>{$('saveProduct').onclick=()=>{const name=$('productName').value.trim(),desc=$('productDesc').value.trim(),price=$('productPrice').value.trim();if(!name||!price){toast('Informe nome e preço');return}products.push({name,desc:desc||'Produto disponível na loja.',price});syncProducts();renderProducts();dismissModal();toast('Produto salvo e catálogo atualizado!')}},0)};function safeText(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}$('chatForm').onsubmit=async e=>{e.preventDefault();const i=$('chatInput');if(!i.value.trim())return;const t=i.value.trim();const c=$('chat');c.innerHTML+='<div class="bubble user">'+safeText(t)+'</div>';i.value='';c.innerHTML+='<div class="bubble ai" id="typing">Estou consultando os produtos...</div>';c.scrollTop=c.scrollHeight;try{const r=await fetch('/api/seller-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t,catalog:products,slug:storeSlug,session_id:customerSession})});const d=await r.json();$('typing')?.remove();c.innerHTML+='<div class="bubble ai">'+safeText(d.reply||'Não consegui responder agora.')+'</div>'}catch(err){$('typing')?.remove();c.innerHTML+='<div class="bubble ai">Não consegui falar com a vendedora agora. Tente novamente.</div>'}c.scrollTop=c.scrollHeight};$('themeBtn').onclick=()=>{document.body.classList.toggle('dark');localStorage.setItem('vc_theme',document.body.classList.contains('dark')?'dark':'light')};$('saveAgentSettings').onclick=saveAgentSettings;if(localStorage.getItem('vc_theme')==='dark')document.body.classList.add('dark');$('backBtn').onclick=()=>{if(screenHistory.length>1){screenHistory.pop();view(screenHistory[screenHistory.length-1],false)}};$('closeModal').onclick=dismissModal;renderProducts();renderOrders();loadProducts();loadOrders();checkSession();const paymentQuery=new URLSearchParams(window.location.search),paymentResult=paymentQuery.get('payment'),returnedPayment=paymentQuery.get('payment_id');if(returnedPayment)fetch('/api/payment/status?id='+encodeURIComponent(returnedPayment)).then(r=>r.json()).then(d=>{if(d.ok)toast('Status do pagamento: '+d.label)}).catch(()=>{});if(paymentResult==='success')setTimeout(()=>toast('Pagamento aprovado! Pedido recebido pela loja.'),700);if(paymentResult==='pending')setTimeout(()=>toast('Pagamento em análise. A loja acompanhará o status.'),700);if(paymentResult==='failure')setTimeout(()=>toast('Pagamento não concluído. Você pode tentar novamente.'),700);if(new URLSearchParams(window.location.search).has('loja')){view('store')}'''
     return {'index.html':html_doc,'styles.css':css,'app.js':js,'forgeai.json':json.dumps({'name':'VendaCertaAI','type':'VendaCertaAI navegável'},ensure_ascii=False)}
 
 
@@ -428,15 +538,46 @@ def vendacerta_page():
     return page.encode('utf-8')
 
 
+def access_codes():
+    data=load_json(ACCESS_CODE_FILE,[])
+    return data if isinstance(data,list) else []
+
+
+def save_access_codes(codes):
+    atomic_save(ACCESS_CODE_FILE,codes[-2000:])
+
+
+def code_hash(code):
+    return hashlib.sha256(str(code).strip().upper().encode()).hexdigest()
+
+
+def public_code(record):
+    return {k:record.get(k) for k in ('plan','days','status','created_at','redeemed_at','redeemed_by')} | {'code':record.get('code') if record.get('status')=='available' else None}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
-    def end_json(self, data, status=200, cookie=None, clear_cookie=False):
+    def end_json(self, data, status=200, cookie=None, clear_cookie=False, admin_cookie=None):
         raw=json.dumps(data,ensure_ascii=False).encode()
-        self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw)))
+        self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store')
         if cookie: set_session(self,cookie)
-        if clear_cookie: self.send_header('Set-Cookie','vc_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0')
+        if admin_cookie: set_session(self,admin_cookie,admin=True)
+        if clear_cookie: self.send_header('Set-Cookie','vc_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0')
         self.end_headers(); self.wfile.write(raw)
+
+    def same_origin(self):
+        origin=self.headers.get('Origin','').strip()
+        if not origin: return True
+        allowed={PUBLIC_BASE, 'http://localhost:8000', 'http://127.0.0.1:8000'}
+        return origin in allowed
+
+    def admin_authenticated(self):
+        token=''
+        for part in self.headers.get('Cookie','').split(';'):
+            if part.strip().startswith('vc_admin='): token=part.strip().split('=',1)[1]
+        data=auth_data(); entry=data.get('admin_sessions',{}).get(token)
+        return bool(isinstance(entry,dict) and time.time()-float(entry.get('created_at',0) or 0)<=SESSION_TTL)
     def do_GET(self):
         path=urlparse(self.path).path
         if path in ('/vendacertaai','/vendacertaai/'):
@@ -454,6 +595,9 @@ class Handler(SimpleHTTPRequestHandler):
             return self.end_json({'ok':True,'slug':slug,'products':store_products(slug)})
         if path=='/api/orders':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]
+            current=session_user(self)
+            if not current or current.get('slug') != slug: return self.end_json({'error':'Acesso não autorizado para esta loja.'},403)
+            if access_status(current)['locked']: return self.end_json({'error':'Seu teste terminou. Ative um plano para continuar usando a gestão da loja.'},402)
             return self.end_json({'ok':True,'slug':slug,'orders':store_orders(slug)})
         if path=='/api/agent/settings':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]
@@ -461,10 +605,15 @@ class Handler(SimpleHTTPRequestHandler):
             if not current or current.get('slug') != slug: return self.end_json({'error':'Faça login para acessar as regras da IA.'},401)
             return self.end_json({'ok':True,'slug':slug,'settings':agent_settings(slug)})
         if path=='/api/payment/status':
-            payment_id=parse_qs(urlparse(self.path).query).get('id',[''])[0]; payment=mp_payment(payment_id)
-            if not payment: return self.end_json({'error':'Pagamento não encontrado.'},404)
-            apply_payment_update(payment)
-            return self.end_json({'ok':True,'payment_id':payment.get('id'),'status':payment.get('status'),'label':payment_label(payment.get('status'))})
+            payment_id=parse_qs(urlparse(self.path).query).get('id',[''])[0].strip()
+            if not payment_id or len(payment_id)>100: return self.end_json({'error':'Pagamento não encontrado.'},404)
+            known=find_payment_record(payment_id)
+            payment=mp_payment(payment_id)
+            if not payment and not known: return self.end_json({'error':'Pagamento não encontrado.'},404)
+            if payment:
+                apply_payment_update(payment)
+                return self.end_json({'ok':True,'payment_id':payment.get('id'),'status':payment.get('status'),'label':payment_label(payment.get('status'))})
+            return self.end_json({'ok':True,'payment_id':payment_id,'status':known.get('status','pending'),'label':payment_label(known.get('status','pending'))})
         if path=='/api/marketplace/summary':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]; current=session_user(self)
             if not current or current.get('slug') != slug: return self.end_json({'error':'Faça login para acessar o resumo financeiro.'},401)
@@ -477,9 +626,12 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
     def do_POST(self):
         route=urlparse(self.path).path
-        if route not in ('/api/generate','/api/modify','/api/seller-chat','/api/store','/api/orders','/api/order/create','/api/payment/create','/api/access/checkout','/api/payment/webhook','/api/marketplace/summary','/api/customer/profile','/api/agent/settings','/api/auth/signup','/api/auth/login','/api/auth/logout'): return self.end_json({'error':'Rota não encontrada'},404)
+        if route not in ('/api/generate','/api/modify','/api/seller-chat','/api/store','/api/orders','/api/order/create','/api/payment/create','/api/access/checkout','/api/payment/webhook','/api/marketplace/summary','/api/customer/profile','/api/agent/settings','/api/auth/signup','/api/auth/login','/api/auth/logout','/api/admin/login','/api/admin/codes','/api/admin/codes/create','/api/access/redeem'): return self.end_json({'error':'Rota não encontrada'},404)
         try:
-            length=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(length) or '{}')
+            if not self.same_origin() and route != '/api/payment/webhook': return self.end_json({'error':'Origem não autorizada.'},403)
+            length=int(self.headers.get('Content-Length','0'))
+            if length > MAX_BODY_BYTES: return self.end_json({'error':'Requisição muito grande.'},413)
+            body=json.loads(self.rfile.read(length) or '{}')
             if route == '/api/auth/signup':
                 email=str(body.get('email','')).strip().lower(); password=str(body.get('password','')); name=str(body.get('name','')).strip(); business=str(body.get('business','')).strip()
                 if '@' not in email or len(password)<6 or not name or not business: return self.end_json({'error':'Preencha nome, negócio, e-mail e senha com pelo menos 6 caracteres.'},400)
@@ -488,14 +640,14 @@ class Handler(SimpleHTTPRequestHandler):
                 slug=slugify(business); used={u.get('slug') for u in data['users'].values()}; base=slug; n=2
                 while slug in used: slug=f'{base}-{n}'; n+=1
                 salt,digest=password_hash(password); now=time.time(); user={'id':secrets.token_hex(12),'email':email,'name':name,'business':business,'slug':slug,'salt':salt,'password_hash':digest,'trial_ends_at':now+48*3600,'access_plan':None,'access_until':0,'plan_status':'trial'}
-                data['users'][email]=user; token=secrets.token_urlsafe(32); data['sessions'][token]=email; save_auth(data); save_store_products(slug,DEFAULT_PRODUCTS.copy()); save_store_orders(slug,[]); save_agent_settings(slug,DEFAULT_AGENT_SETTINGS.copy())
+                data['users'][email]=user; token=secrets.token_urlsafe(32); data['sessions'][token]={'email':email,'created_at':time.time()}; save_auth(data); save_store_products(slug,DEFAULT_PRODUCTS.copy()); save_store_orders(slug,[]); save_agent_settings(slug,DEFAULT_AGENT_SETTINGS.copy())
                 return self.end_json({'ok':True,'user':{k:user[k] for k in ('id','name','business','slug','trial_ends_at')}},cookie=token)
             if route == '/api/auth/login':
                 email=str(body.get('email','')).strip().lower(); password=str(body.get('password','')); data=auth_data(); user=data['users'].get(email)
                 if not user: return self.end_json({'error':'E-mail ou senha inválidos.'},401)
                 _,digest=password_hash(password,user.get('salt'))
                 if not secrets.compare_digest(digest,user.get('password_hash','')): return self.end_json({'error':'E-mail ou senha inválidos.'},401)
-                token=secrets.token_urlsafe(32); data['sessions'][token]=email; save_auth(data)
+                token=secrets.token_urlsafe(32); data['sessions'][token]={'email':email,'created_at':time.time()}; save_auth(data)
                 return self.end_json({'ok':True,'user':{k:user[k] for k in ('id','name','business','slug','trial_ends_at')}},cookie=token)
             if route == '/api/auth/logout':
                 token=''
@@ -503,6 +655,30 @@ class Handler(SimpleHTTPRequestHandler):
                     if part.strip().startswith('vc_session='): token=part.strip().split('=',1)[1]
                 data=auth_data(); data['sessions'].pop(token,None); save_auth(data)
                 return self.end_json({'ok':True},clear_cookie=True)
+            if route == '/api/admin/login':
+                configured=os.environ.get('ADMIN_PASSWORD','').strip()
+                password=str(body.get('password',''))
+                if not configured: return self.end_json({'error':'Central ADM desativada: configure ADMIN_PASSWORD no ambiente seguro.'},503)
+                if not hmac.compare_digest(password,configured): return self.end_json({'error':'Senha incorreta.'},401)
+                token=secrets.token_urlsafe(32); data=auth_data(); data['admin_sessions'][token]={'created_at':time.time()}; save_auth(data)
+                return self.end_json({'ok':True},admin_cookie=token)
+            if route in ('/api/admin/codes','/api/admin/codes/create'):
+                if not self.admin_authenticated(): return self.end_json({'error':'Sessão ADM inválida.'},401)
+                codes=access_codes()
+                if route == '/api/admin/codes': return self.end_json({'ok':True,'codes':[public_code(c) for c in codes]})
+                plan=str(body.get('plan','')).upper().strip()
+                if plan not in PLAN_DAYS: return self.end_json({'error':'Plano inválido.'},400)
+                code=plan+'-'+secrets.token_hex(5).upper(); record={'hash':code_hash(code),'code':code,'plan':plan,'days':PLAN_DAYS[plan],'status':'available','created_at':time.time()}; codes.append(record); save_access_codes(codes); audit_event('platform','access_code_created',{'plan':plan}); return self.end_json({'ok':True,'code':code,'plan':plan,'days':PLAN_DAYS[plan]})
+            if route == '/api/access/redeem':
+                current=session_user(self)
+                if not current: return self.end_json({'error':'Entre na sua conta para usar um código.'},401)
+                raw=str(body.get('code','')).strip().upper()
+                if not raw or len(raw)>80: return self.end_json({'error':'Código inválido.'},400)
+                codes=access_codes(); record=next((c for c in codes if c.get('hash')==code_hash(raw) and c.get('status')=='available'),None)
+                if not record: return self.end_json({'error':'Código inválido, já utilizado ou expirado.'},400)
+                now=time.time(); data=auth_data(); user=data['users'].get(current.get('email',''))
+                start=max(now,float(user.get('access_until',0) or 0)); user['access_plan']=record['plan']; user['access_until']=start+int(record['days'])*86400; user['plan_status']='active'; save_auth(data)
+                record.update({'status':'redeemed','redeemed_at':now,'redeemed_by':user.get('id')}); save_access_codes(codes); audit_event(user.get('slug',''),'access_code_redeemed',{'plan':record['plan']}); return self.end_json({'ok':True,'access':access_status(user)})
             if route == '/api/access/checkout':
                 current=session_user(self)
                 if not current: return self.end_json({'error':'Entre na sua conta para escolher um plano.'},401)
@@ -510,7 +686,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if plan not in PLAN_PRICES: return self.end_json({'error':'Plano inválido.'},400)
                 preference,error=create_plan_preference(current.get('email',''),plan)
                 if error: return self.end_json({'error':error},503)
-                return self.end_json({'ok':True,'plan':plan,'price':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'checkout_url':preference.get('init_point') or preference.get('sandbox_init_point'),'preference_id':preference.get('id')})
+                checkout_url=preference.get('init_point') or preference.get('sandbox_init_point')
+                if not checkout_url: return self.end_json({'error':'O Mercado Pago não retornou um link de checkout válido.'},503)
+                reference=str(preference.get('external_reference',''))
+                save_payment_record({'reference':reference,'preference_id':str(preference.get('id','')),'email':current.get('email',''),'plan':plan,'amount':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'status':'created','created_at':time.time(),'checkout_url':checkout_url})
+                audit_event(current.get('slug',''),'plan_checkout_created',{'plan':plan,'preference_id':str(preference.get('id',''))})
+                return self.end_json({'ok':True,'plan':plan,'price':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'checkout_url':checkout_url,'preference_id':preference.get('id')})
             if route == '/api/customer/profile':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; session_id=str(body.get('session_id','')).strip()[:100]; name=str(body.get('name','')).strip()[:100]; phone=str(body.get('phone','')).strip()[:30]
                 if not session_id or not name or not phone: return self.end_json({'error':'Informe nome e telefone.'},400)
@@ -519,7 +700,7 @@ class Handler(SimpleHTTPRequestHandler):
             if route == '/api/payment/webhook':
                 if not verify_mp_webhook(self,body): return self.end_json({'error':'Notificação não autenticada.'},401)
                 notification_type=str(body.get('type') or body.get('topic') or '').lower(); payment_id=(body.get('data',{}).get('id') if isinstance(body.get('data',{}),dict) else body.get('id'))
-                if notification_type in ('payment','merchant_order') and payment_id:
+                if notification_type == 'payment' and payment_id:
                     payment=mp_payment(payment_id)
                     if payment: apply_payment_update(payment)
                 return self.end_json({'ok':True})
@@ -527,45 +708,76 @@ class Handler(SimpleHTTPRequestHandler):
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'
                 if not store_access_active(slug): return self.end_json({'error':'O período de teste terminou. Ative um plano para continuar vendendo.'},402)
                 order=body.get('order',{}); session_id=str(body.get('session_id','')).strip()[:100]; customer=body.get('customer',{}) if isinstance(body.get('customer',{}),dict) else {}
-                if not isinstance(order,dict) or not str(order.get('product','')).strip(): return self.end_json({'error':'Pedido inválido.'},400)
-                amount=price_number(order.get('price',''))
-                if amount <= 0: return self.end_json({'error':'Preço inválido para pagamento.'},400)
-                order_id=str(order.get('id') or str(time.time()).replace('.','')[-8:]); commission_amount=round(amount*PLATFORM_COMMISSION_RATE,2); seller_amount=round(amount-commission_amount,2); preference,error=create_mp_preference(order.get('product'),amount,order_id,slug)
+                if not isinstance(order,dict): return self.end_json({'error':'Pedido inválido.'},400)
+                product=catalog_product(slug,order)
+                if not product: return self.end_json({'error':'Produto não encontrado no catálogo atual.'},409)
+                customer_name=str(customer.get('name','')).strip()[:100]; customer_phone=str(customer.get('phone','')).strip()[:30]
+                if not customer_name or not customer_phone: return self.end_json({'error':'Informe nome e telefone.'},400)
+                order_id=str(order.get('id') or secrets.token_hex(10))[:80]
+                orders=store_orders(slug)
+                existing=next((o for o in orders if str(o.get('id'))==order_id),None)
+                if existing and existing.get('checkout_url'): return self.end_json({'ok':True,'order':existing,'checkout_url':existing['checkout_url'],'payment_provider':'mercadopago','idempotent':True})
+                amount=price_number(product.get('price','')); commission_amount=round(amount*PLATFORM_COMMISSION_RATE,2); seller_amount=round(amount-commission_amount,2)
+                preference,error=create_mp_preference(product.get('name'),amount,order_id,slug)
                 if error: return self.end_json({'error':error},503)
-                if session_id and str(customer.get('name','')).strip() and str(customer.get('phone','')).strip():
-                    previous=customer_profile(slug,session_id); profile={'name':str(customer.get('name')).strip()[:100],'phone':str(customer.get('phone')).strip()[:30],'updated_at':time.time(),'orders':previous.get('orders',[])+[str(order.get('product',''))]}; save_customer_profile(slug,session_id,profile)
-                orders=store_orders(slug); saved={'id':order_id,'product':str(order.get('product')),'price':str(order.get('price','')),'customer_name':str(customer.get('name','')).strip()[:100],'customer_phone':str(customer.get('phone','')).strip()[:30],'session_id':session_id,'status':'Pagamento pendente','payment_preference_id':preference.get('id'),'checkout_url':preference.get('init_point') or preference.get('sandbox_init_point'),'commission_rate':PLATFORM_COMMISSION_RATE,'commission_amount':commission_amount,'seller_amount_estimate':seller_amount,'settlement_status':'Aguardando conexão OAuth do vendedor'}; orders.append(saved); save_store_orders(slug,orders)
-                return self.end_json({'ok':True,'order':saved,'checkout_url':saved['checkout_url'],'payment_provider':'mercadopago'})
+                checkout_url=preference.get('init_point') or preference.get('sandbox_init_point')
+                if not checkout_url: return self.end_json({'error':'O Mercado Pago não retornou um link de checkout válido.'},503)
+                saved={'id':order_id,'product':product.get('name'),'product_id':product.get('id'),'price':product.get('price'),'customer_name':customer_name,'customer_phone':customer_phone,'session_id':session_id,'status':'Pagamento pendente','payment_preference_id':preference.get('id'),'checkout_url':checkout_url,'commission_rate':PLATFORM_COMMISSION_RATE,'commission_amount':commission_amount,'seller_amount_estimate':seller_amount,'settlement_status':'Aguardando conexão OAuth do vendedor','created_at':time.time()}
+                if session_id:
+                    previous=customer_profile(slug,session_id); profile={'name':customer_name,'phone':customer_phone,'updated_at':time.time(),'orders':previous.get('orders',[])+[product.get('name')]}; save_customer_profile(slug,session_id,profile)
+                orders.append(saved); save_store_orders(slug,orders); audit_event(slug,'order_payment_created',{'order_id':order_id,'preference_id':str(preference.get('id',''))})
+                return self.end_json({'ok':True,'order':saved,'checkout_url':checkout_url,'payment_provider':'mercadopago'})
             if route == '/api/order/create':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'
                 if not store_access_active(slug): return self.end_json({'error':'O período de teste terminou. A loja precisa ativar um plano para aceitar novos pedidos.'},402)
                 order=body.get('order',{}); session_id=str(body.get('session_id','')).strip()[:100]; customer=body.get('customer',{}) if isinstance(body.get('customer',{}),dict) else {}
-                if session_id and str(customer.get('name','')).strip() and str(customer.get('phone','')).strip():
-                    previous=customer_profile(slug,session_id); profile={'name':str(customer.get('name')).strip()[:100],'phone':str(customer.get('phone')).strip()[:30],'updated_at':time.time(),'orders':previous.get('orders',[])}; profile['orders']=profile['orders']+ [str(order.get('product',''))]; save_customer_profile(slug,session_id,profile)
-                
-                if not isinstance(order,dict) or not str(order.get('product','')).strip(): return self.end_json({'error':'Pedido inválido.'},400)
-                orders=store_orders(slug); orders.append({'id':str(order.get('id') or str(time.time()).replace('.','')[-8:]),'product':str(order.get('product')),'price':str(order.get('price','')),'customer_name':str(customer.get('name','')).strip()[:100],'customer_phone':str(customer.get('phone','')).strip()[:30],'session_id':session_id,'status':'Novo'})
-                save_store_orders(slug,orders)
-                return self.end_json({'ok':True,'order':orders[-1]})
+                if not isinstance(order,dict): return self.end_json({'error':'Pedido inválido.'},400)
+                product=catalog_product(slug,order)
+                customer_name=str(customer.get('name','')).strip()[:100]; customer_phone=str(customer.get('phone','')).strip()[:30]
+                if not product or not customer_name or not customer_phone: return self.end_json({'error':'Produto, nome e telefone são obrigatórios.'},400)
+                order_id=str(order.get('id') or secrets.token_hex(10))[:80]; orders=store_orders(slug)
+                if any(str(o.get('id'))==order_id for o in orders): return self.end_json({'ok':True,'order':next(o for o in orders if str(o.get('id'))==order_id),'idempotent':True})
+                saved={'id':order_id,'product':product.get('name'),'product_id':product.get('id'),'price':product.get('price'),'customer_name':customer_name,'customer_phone':customer_phone,'session_id':session_id,'status':'Novo','created_at':time.time()}
+                if session_id:
+                    previous=customer_profile(slug,session_id); profile={'name':customer_name,'phone':customer_phone,'updated_at':time.time(),'orders':previous.get('orders',[])+[product.get('name')]}; save_customer_profile(slug,session_id,profile)
+                orders.append(saved); save_store_orders(slug,orders); audit_event(slug,'order_created',{'order_id':order_id})
+                return self.end_json({'ok':True,'order':saved})
             if route == '/api/orders':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; current=session_user(self)
                 if not current: return self.end_json({'error':'Faça login para gerenciar pedidos.'},401)
                 if current.get('slug') != slug: return self.end_json({'error':'Acesso não autorizado para esta loja.'},403)
                 if access_status(current)['locked']: return self.end_json({'error':'Seu teste terminou. Ative um plano para continuar usando a gestão da loja.'},402)
-                orders=body.get('orders',[])
-                if not isinstance(orders,list): return self.end_json({'error':'Pedidos inválidos'},400)
-                save_store_orders(slug,orders)
-                return self.end_json({'ok':True,'slug':slug,'orders':orders})
+                incoming=body.get('orders',[])
+                if not isinstance(incoming,list) or len(incoming)>1000: return self.end_json({'error':'Pedidos inválidos'},400)
+                existing=store_orders(slug); by_id={str(o.get('id')):o for o in existing if isinstance(o,dict) and o.get('id')}
+                products=store_products(slug)
+                for raw in incoming:
+                    if not isinstance(raw,dict): continue
+                    oid=str(raw.get('id','')).strip()[:80]
+                    if not oid: continue
+                    product=catalog_product(slug,raw)
+                    if not product: continue
+                    if oid in by_id:
+                        # Client synchronization may not overwrite payment/customer facts.
+                        if str(by_id[oid].get('status','')) in ('Novo','Pedido recebido') and raw.get('status') in ('Novo','Pedido recebido'):
+                            by_id[oid]['status']=str(raw.get('status'))
+                    else:
+                        by_id[oid]={'id':oid,'product':product.get('name'),'product_id':product.get('id'),'price':product.get('price'),'customer_name':str(raw.get('customer_name','')).strip()[:100],'customer_phone':str(raw.get('customer_phone','')).strip()[:30],'session_id':str(raw.get('session_id','')).strip()[:100],'status':'Novo','created_at':time.time()}
+                merged=list(by_id.values())[-1000:]; save_store_orders(slug,merged); audit_event(slug,'orders_synchronized',{'count':len(merged)})
+                return self.end_json({'ok':True,'slug':slug,'orders':merged})
             if route == '/api/store':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; current=session_user(self)
                 if not current: return self.end_json({'error':'Faça login para gerenciar produtos.'},401)
                 if current.get('slug') != slug: return self.end_json({'error':'Acesso não autorizado para esta loja.'},403)
                 if access_status(current)['locked']: return self.end_json({'error':'Seu teste terminou. Ative um plano para continuar gerenciando produtos.'},402)
                 products=body.get('products',[])
-                if not isinstance(products,list) or not products: return self.end_json({'error':'Catálogo inválido'},400)
-                clean=[p for p in products if isinstance(p,dict) and str(p.get('name','')).strip() and str(p.get('price','')).strip()]
-                if not clean: return self.end_json({'error':'Adicione pelo menos um produto'},400)
-                save_store_products(slug,clean)
+                if not isinstance(products,list) or len(products)>500: return self.end_json({'error':'Catálogo inválido'},400)
+                clean=[]
+                for product in products:
+                    item=clean_product(product)
+                    if item: clean.append(item)
+                if not clean: return self.end_json({'error':'Adicione pelo menos um produto válido'},400)
+                save_store_products(slug,clean); audit_event(slug,'catalog_updated',{'count':len(clean)})
                 return self.end_json({'ok':True,'slug':slug,'products':clean})
             if route == '/api/agent/settings':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; current=session_user(self)
@@ -579,7 +791,7 @@ class Handler(SimpleHTTPRequestHandler):
                 save_agent_settings(slug,settings)
                 return self.end_json({'ok':True,'slug':slug,'settings':settings})
             if route == '/api/seller-chat':
-                message=str(body.get('message','')).strip(); slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; session_id=str(body.get('session_id','')).strip()[:100]; catalog=body.get('catalog',[])
+                message=str(body.get('message','')).strip()[:2000]; slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; session_id=str(body.get('session_id','')).strip()[:100]; catalog=store_products(slug)
                 if not message: return self.end_json({'error':'Digite uma mensagem'},400)
                 if not store_access_active(slug): return self.end_json({'ok':False,'reply':'Esta loja está temporariamente pausada enquanto o empreendedor ativa um plano.','ai_enabled':False},402)
                 if not session_id: session_id=secrets.token_urlsafe(12)
