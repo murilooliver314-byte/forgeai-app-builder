@@ -1,0 +1,3 @@
+# Optional durable storage adapter. The app keeps an explicit JSON beta fallback
+# when DATABASE_URL is absent or PostgreSQL is temporarily unavailable.
+psycopg2-binary>=2.9.9,<3
