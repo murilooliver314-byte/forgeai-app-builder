@@ -491,7 +491,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if plan not in PLAN_PRICES: return self.end_json({'error':'Plano inválido.'},400)
                 preference,error=create_plan_preference(current.get('email',''),plan)
                 if error: return self.end_json({'error':error},503)
-                return self.end_json({'ok':True,'plan':plan,'price':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'checkout_url':preference.get('sandbox_init_point') or preference.get('init_point'),'preference_id':preference.get('id')})
+                return self.end_json({'ok':True,'plan':plan,'price':PLAN_PRICES[plan],'days':PLAN_DAYS[plan],'checkout_url':preference.get('init_point') or preference.get('sandbox_init_point'),'preference_id':preference.get('id')})
             if route == '/api/customer/profile':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'; session_id=str(body.get('session_id','')).strip()[:100]; name=str(body.get('name','')).strip()[:100]; phone=str(body.get('phone','')).strip()[:30]
                 if not session_id or not name or not phone: return self.end_json({'error':'Informe nome e telefone.'},400)
@@ -514,7 +514,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if error: return self.end_json({'error':error},503)
                 if session_id and str(customer.get('name','')).strip() and str(customer.get('phone','')).strip():
                     previous=customer_profile(slug,session_id); profile={'name':str(customer.get('name')).strip()[:100],'phone':str(customer.get('phone')).strip()[:30],'updated_at':time.time(),'orders':previous.get('orders',[])+[str(order.get('product',''))]}; save_customer_profile(slug,session_id,profile)
-                orders=store_orders(slug); saved={'id':order_id,'product':str(order.get('product')),'price':str(order.get('price','')),'customer_name':str(customer.get('name','')).strip()[:100],'customer_phone':str(customer.get('phone','')).strip()[:30],'session_id':session_id,'status':'Pagamento pendente','payment_preference_id':preference.get('id'),'checkout_url':preference.get('sandbox_init_point') or preference.get('init_point'),'commission_rate':PLATFORM_COMMISSION_RATE,'commission_amount':commission_amount,'seller_amount_estimate':seller_amount,'settlement_status':'Aguardando conexão OAuth do vendedor'}; orders.append(saved); save_store_orders(slug,orders)
+                orders=store_orders(slug); saved={'id':order_id,'product':str(order.get('product')),'price':str(order.get('price','')),'customer_name':str(customer.get('name','')).strip()[:100],'customer_phone':str(customer.get('phone','')).strip()[:30],'session_id':session_id,'status':'Pagamento pendente','payment_preference_id':preference.get('id'),'checkout_url':preference.get('init_point') or preference.get('sandbox_init_point'),'commission_rate':PLATFORM_COMMISSION_RATE,'commission_amount':commission_amount,'seller_amount_estimate':seller_amount,'settlement_status':'Aguardando conexão OAuth do vendedor'}; orders.append(saved); save_store_orders(slug,orders)
                 return self.end_json({'ok':True,'order':saved,'checkout_url':saved['checkout_url'],'payment_provider':'mercadopago'})
             if route == '/api/order/create':
                 slug=str(body.get('slug','vendacertaai')).strip() or 'vendacertaai'
