@@ -1,7 +1,7 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, quote, parse_qs
-import json, re, html, tarfile, io, time, os, urllib.request, urllib.error, hashlib, secrets
+import json, re, html, tarfile, io, time, os, urllib.request, urllib.error, hashlib, hmac, secrets
 
 ROOT = Path(__file__).parent.resolve()
 DATA = ROOT / 'generated'
@@ -222,7 +222,9 @@ def apply_payment_update(payment):
         if status!='approved' or plan not in PLAN_DAYS: return False
         data=auth_data(); user=data['users'].get(email)
         if not user: return False
-        now=time.time(); start=max(now,float(user.get('access_until',0) or 0)); user['access_plan']=plan; user['access_until']=start+PLAN_DAYS[plan]*86400; user['plan_status']='active'; user['last_payment_id']=str(payment.get('id','')); user['last_payment_at']=now; save_auth(data); return True
+        payment_id=str(payment.get('id',''))
+        if payment_id and payment_id==str(user.get('last_payment_id','')): return True
+        now=time.time(); start=max(now,float(user.get('access_until',0) or 0)); user['access_plan']=plan; user['access_until']=start+PLAN_DAYS[plan]*86400; user['plan_status']='active'; user['last_payment_id']=payment_id; user['last_payment_at']=now; save_auth(data); return True
     if ':' not in reference: return False
     slug,order_id=reference.split(':',1); orders=store_orders(slug); changed=False
     for order in orders:
@@ -245,6 +247,23 @@ def user_by_slug(slug):
 def store_access_active(slug):
     user=user_by_slug(slug)
     return True if not user else not access_status(user)['locked']
+
+
+def verify_mp_webhook(handler, body):
+    secret=os.environ.get('MERCADO_PAGO_WEBHOOK_SECRET','').strip()
+    if not secret: return True
+    signature=handler.headers.get('x-signature',''); request_id=handler.headers.get('x-request-id','')
+    query=parse_qs(urlparse(handler.path).query); data_id=(query.get('data.id') or [''])[0]
+    if not data_id and isinstance(body.get('data'),dict): data_id=str(body['data'].get('id',''))
+    values={}
+    for part in signature.split(','):
+        if '=' in part:
+            k,v=part.strip().split('=',1); values[k]=v
+    ts=values.get('ts',''); received=values.get('v1','')
+    if not ts or not received or not request_id or not data_id: return False
+    manifest='id:'+data_id+';request-id:'+request_id+';ts:'+ts+';'
+    expected=hmac.new(secret.encode(),manifest.encode(),hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected,received)
 
 
 def marketplace_summary(slug):
@@ -498,6 +517,7 @@ class Handler(SimpleHTTPRequestHandler):
                 previous=customer_profile(slug,session_id); profile={'name':name,'phone':phone,'updated_at':time.time(),'orders':previous.get('orders',[])}; save_customer_profile(slug,session_id,profile)
                 return self.end_json({'ok':True,'profile':profile})
             if route == '/api/payment/webhook':
+                if not verify_mp_webhook(self,body): return self.end_json({'error':'Notificação não autenticada.'},401)
                 notification_type=str(body.get('type') or body.get('topic') or '').lower(); payment_id=(body.get('data',{}).get('id') if isinstance(body.get('data',{}),dict) else body.get('id'))
                 if notification_type in ('payment','merchant_order') and payment_id:
                     payment=mp_payment(payment_id)
