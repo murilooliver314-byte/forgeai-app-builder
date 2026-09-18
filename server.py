@@ -3,6 +3,13 @@ from pathlib import Path
 from urllib.parse import urlparse, quote, parse_qs
 import json, re, html, tarfile, io, time, os, urllib.request, urllib.error, hashlib, hmac, secrets, threading, tempfile
 
+try:
+    import psycopg2
+    from psycopg2.extras import Json as PostgresJson
+except ImportError:  # Optional dependency: beta JSON storage remains available.
+    psycopg2 = None
+    PostgresJson = None
+
 ROOT = Path(__file__).parent.resolve()
 DATA = ROOT / 'generated'
 DATA.mkdir(exist_ok=True)
@@ -30,25 +37,144 @@ PLAN_LABELS = {'BASICO':'Básico','PRO':'Pro','ENTERPRISE':'Enterprise'}
 DEFAULT_PRODUCTS = [{'name':'Produto especial','desc':'Qualidade e estilo para você.','price':'R$ 49,90'},{'name':'Mais vendido','desc':'O favorito dos clientes.','price':'R$ 79,90'},{'name':'Novidade','desc':'Acabou de chegar na loja.','price':'R$ 99,90'}]
 
 
+class StorageBackend:
+    """Small storage port shared by the current domain functions.
 
-def load_json(path, default):
-    try:
-        if path.exists():
-            value=json.loads(path.read_text(encoding='utf-8'))
-            return value
-    except Exception:
-        # Recover from the most recent local backup after a torn write.
+    PostgreSQL is deliberately a key/value envelope for this migration phase: it
+    preserves the existing JSON-shaped domain data while giving Render a durable,
+    transactional store. The beta filesystem path is explicit and never reported
+    as durable production storage.
+    """
+    VERSION = 'kv-v1'
+
+    def __init__(self, data_dir):
+        self.data_dir = Path(data_dir)
+        self.url_configured = bool(os.environ.get('DATABASE_URL', '').strip())
+        self.mode = 'json-beta'
+        self.reason = 'DATABASE_URL não configurada; armazenamento local não durável para beta.'
+        self.migration = 'not_configured'
+        self.lock = threading.RLock()
+        if self.url_configured and psycopg2 is None:
+            self.reason = 'DATABASE_URL configurada, mas o driver PostgreSQL não está instalado.'
+        elif self.url_configured:
+            try:
+                self._ensure_schema()
+                self._migrate_legacy_files()
+                self.mode = 'postgresql'
+                self.reason = ''
+                self.migration = 'kv-v1-ready'
+            except Exception as exc:
+                self.mode = 'json-beta'
+                self.reason = 'PostgreSQL configurado, mas indisponível; fallback local beta ativo (' + type(exc).__name__ + ').'
+                self.migration = 'failed'
+
+    def _connect(self):
+        return psycopg2.connect(self.url_configured and os.environ.get('DATABASE_URL', '').strip(), connect_timeout=8)
+
+    def _ensure_schema(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''CREATE TABLE IF NOT EXISTS vendacertaai_kv (
+                    key TEXT PRIMARY KEY,
+                    value JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS vendacertaai_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )''')
+                cur.execute("INSERT INTO vendacertaai_migrations(version) VALUES (%s) ON CONFLICT (version) DO NOTHING", (self.VERSION,))
+            conn.commit()
+
+    def _migrate_legacy_files(self):
+        files = list(self.data_dir.glob('*.json'))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for path in files:
+                    try:
+                        value = json.loads(path.read_text(encoding='utf-8'))
+                    except Exception:
+                        continue
+                    cur.execute('''INSERT INTO vendacertaai_kv(key,value) VALUES (%s,%s)
+                                   ON CONFLICT (key) DO NOTHING''', (path.name, PostgresJson(value)))
+            conn.commit()
+
+    def _fallback_read(self, path, default):
         try:
-            candidates=sorted(BACKUP_DIR.glob(path.name+'.*.bak'), reverse=True)
-            if candidates:
-                return json.loads(candidates[0].read_text(encoding='utf-8'))
+            if path.exists():
+                return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             pass
+        return default
+
+    def read(self, path, default):
+        if self.mode != 'postgresql':
+            return self._fallback_read(path, default)
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT value FROM vendacertaai_kv WHERE key=%s', (path.name,))
+                    row = cur.fetchone()
+                    return row[0] if row else default
+        except Exception as exc:
+            self.mode = 'json-beta'
+            self.reason = 'Falha de leitura PostgreSQL; fallback local beta ativo (' + type(exc).__name__ + ').'
+            return self._fallback_read(path, default)
+
+    def write(self, path, value):
+        if self.mode != 'postgresql':
+            return False
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute('''INSERT INTO vendacertaai_kv(key,value,updated_at) VALUES (%s,%s,NOW())
+                                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()''', (path.name, PostgresJson(value)))
+                conn.commit()
+            return True
+        except Exception as exc:
+            self.mode = 'json-beta'
+            self.reason = 'Falha de gravação PostgreSQL; fallback local beta ativo (' + type(exc).__name__ + ').'
+            return False
+
+    def status(self):
+        durable = self.mode == 'postgresql'
+        return {
+            'backend': 'postgresql' if durable else 'json-beta',
+            'durable': durable,
+            'database_url_configured': self.url_configured,
+            'migration': self.migration,
+            'version': self.VERSION,
+            'fallback': not durable,
+            'message': self.reason if not durable else 'PostgreSQL durável ativo.'
+        }
+
+
+# Initialized once; all later data access goes through this port.
+STORAGE = StorageBackend(DATA)
+
+
+def storage_status():
+    return STORAGE.status()
+
+
+def load_json(path, default):
+    value = STORAGE.read(path, default)
+    if value is not default:
+        return value
+    # Recover from the most recent local backup after a torn beta write.
+    try:
+        candidates=sorted(BACKUP_DIR.glob(path.name+'.*.bak'), reverse=True)
+        if candidates:
+            return json.loads(candidates[0].read_text(encoding='utf-8'))
+    except Exception:
+        pass
     return default
 
 
 def atomic_save(path, value):
     raw=json.dumps(value, ensure_ascii=False, indent=2)
+    if STORAGE.write(path, value):
+        return
     with DATA_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -339,7 +465,7 @@ def apply_payment_update(payment):
 
 def access_status(user):
     now=time.time(); trial_until=float(user.get('trial_ends_at',0) or 0); access_until=float(user.get('access_until',0) or 0); active_trial=trial_until>now; active_plan=access_until>now
-    return {'trial_active':active_trial,'trial_ends_at':trial_until,'plan_active':active_plan,'plan':user.get('access_plan'),'access_until':access_until,'locked':not(active_trial or active_plan)}
+    return {'trial_active':active_trial,'trial_ends_at':trial_until,'plan_active':active_plan,'plan':user.get('access_plan'),'plan_status':user.get('plan_status'),'access_until':access_until,'payment_history_count':int(user.get('payment_history_count',0) or 0),'last_payment_at':user.get('last_payment_at'),'locked':not(active_trial or active_plan)}
 
 
 def user_by_slug(slug):
@@ -374,6 +500,26 @@ def verify_mp_webhook(handler, body):
     manifest='id:'+data_id+';request-id:'+request_id+';ts:'+ts+';'
     expected=hmac.new(secret.encode(),manifest.encode(),hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected,received)
+
+
+def tenant_payment_history(slug, email):
+    """Return only payment records belonging to this authenticated tenant."""
+    out=[]
+    for record in payment_history().values():
+        if not isinstance(record,dict):
+            continue
+        reference=str(record.get('reference',''))
+        owner = str(record.get('email','')).lower() == str(email).lower() or reference.startswith(str(slug)+':')
+        if not owner:
+            continue
+        out.append({k:record.get(k) for k in ('payment_id','preference_id','reference','plan','amount','days','status','payment_status','activated_at','activation_until','created_at','updated_at','validation') if k in record})
+    return sorted(out, key=lambda x: float(x.get('created_at',0) or 0), reverse=True)[:100]
+
+
+def tenant_audit_events(slug):
+    data=load_json(AUDIT_FILE,{})
+    events=data.get(str(slug),[]) if isinstance(data,dict) else []
+    return events[-200:] if isinstance(events,list) else []
 
 
 def marketplace_summary(slug):
@@ -582,7 +728,9 @@ class Handler(SimpleHTTPRequestHandler):
         path=urlparse(self.path).path
         if path in ('/vendacertaai','/vendacertaai/'):
             raw=vendacerta_page(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-        if path=='/api/health': return self.end_json({'ok':True,'service':'ForgeAI'})
+        if path=='/api/health':
+            storage=storage_status()
+            return self.end_json({'ok':True,'service':'ForgeAI','storage':storage,'readiness':'durable' if storage['durable'] else 'beta'})
         if path=='/api/auth/me':
             user=session_user(self)
             return self.end_json({'ok':bool(user),'user':({k:user.get(k) for k in ('id','name','business','slug','trial_ends_at')} if user else None)})
@@ -591,7 +739,9 @@ class Handler(SimpleHTTPRequestHandler):
             if not current: return self.end_json({'ok':False,'locked':True,'user':None})
             return self.end_json({'ok':True,'user':{k:current.get(k) for k in ('name','business','slug')},'access':access_status(current)})
         if path=='/api/store':
-            slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]
+            slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0].strip() or 'vendacertaai'
+            if slug != 'vendacertaai' and not user_by_slug(slug):
+                return self.end_json({'error':'Loja não encontrada.'},404)
             return self.end_json({'ok':True,'slug':slug,'products':store_products(slug)})
         if path=='/api/orders':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]
@@ -614,6 +764,16 @@ class Handler(SimpleHTTPRequestHandler):
                 apply_payment_update(payment)
                 return self.end_json({'ok':True,'payment_id':payment.get('id'),'status':payment.get('status'),'label':payment_label(payment.get('status'))})
             return self.end_json({'ok':True,'payment_id':payment_id,'status':known.get('status','pending'),'label':payment_label(known.get('status','pending'))})
+        if path=='/api/payment/history':
+            slug=parse_qs(urlparse(self.path).query).get('loja',[''])[0].strip(); current=session_user(self)
+            if not current or current.get('slug') != slug:
+                return self.end_json({'error':'Faça login para acessar o histórico de pagamentos.'},401)
+            return self.end_json({'ok':True,'slug':slug,'payments':tenant_payment_history(slug,current.get('email',''))})
+        if path=='/api/audit':
+            slug=parse_qs(urlparse(self.path).query).get('loja',[''])[0].strip(); current=session_user(self)
+            if not current or current.get('slug') != slug:
+                return self.end_json({'error':'Acesso não autorizado ao histórico de auditoria.'},401)
+            return self.end_json({'ok':True,'slug':slug,'events':tenant_audit_events(slug)})
         if path=='/api/marketplace/summary':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]; current=session_user(self)
             if not current or current.get('slug') != slug: return self.end_json({'error':'Faça login para acessar o resumo financeiro.'},401)
