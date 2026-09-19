@@ -32,7 +32,7 @@ MAX_VIDEO_BYTES = 320 * 1024
 MAX_VIDEO_DATA_URL = 460000
 PUBLIC_BASE = 'https://forgeai-app-builder.onrender.com'
 PAYMENT_FILE = DATA / 'payment_settings.json'
-DEFAULT_AGENT_SETTINGS = {'min_margin':20,'max_discount':10,'require_approval':True,'tone':'consultivo','persona_name':'Consultora Certa','persona_description':'Uma vendedora atenciosa, clara e honesta da sua loja.'}
+DEFAULT_AGENT_SETTINGS = {'min_margin':20,'max_discount':10,'require_approval':True,'tone':'consultivo','persona_name':'Consultora Certa','persona_description':'Uma vendedora atenciosa, clara e honesta da sua loja.','pilot_mode':True}
 PLATFORM_COMMISSION_RATE = 0.05
 PLAN_DAYS = {'BASICO':30,'PRO':180,'ENTERPRISE':365}
 PLAN_PRICES = {'BASICO':98.90,'PRO':489.90,'ENTERPRISE':1089.90}
@@ -586,6 +586,39 @@ def tenant_audit_events(slug):
     return events[-200:] if isinstance(events,list) else []
 
 
+def tenant_metrics(slug):
+    """Conservative metrics derived only from persisted catalog/orders."""
+    products=store_products(slug); orders=store_orders(slug)
+    paid=[o for o in orders if str(o.get('status','')).casefold()=='pago']
+    known_prices=[price_number(p.get('price')) for p in products if price_number(p.get('price'))>0]
+    return {'catalog_products':len(products),'orders_total':len(orders),'orders_paid':len(paid),
+            'gross_paid':round(sum(price_number(o.get('price')) for o in paid),2),
+            'average_paid_order':round(sum(price_number(o.get('price')) for o in paid)/len(paid),2) if paid else None,
+            'data_sufficiency':'insufficient' if len(orders)<3 or not paid else 'initial',
+            'note':'Métricas calculadas somente com pedidos persistidos; sem estimativas ou projeções.'}
+
+
+def onboarding_checklist(slug):
+    products=store_products(slug); settings=agent_settings(slug); videos=store_videos(slug)
+    checks=[
+        {'id':'catalog','label':'Cadastre pelo menos um produto com preço e descrição','done':bool(products and any(price_number(p.get('price'))>0 for p in products))},
+        {'id':'image','label':'Adicione imagens aos produtos principais (opcional)','done':any(bool(p.get('image')) for p in products)},
+        {'id':'persona','label':'Revise o nome, tom e orientação da sua Consultora IA','done':bool(settings.get('persona_name') and settings.get('persona_description'))},
+        {'id':'video','label':'Publique um vídeo curto para apresentar um produto (opcional)','done':bool(videos)},
+        {'id':'link','label':'Copie e compartilhe o link público da loja','done':False},
+    ]
+    return {'checks':checks,'ready':sum(1 for c in checks if c['done'])>=2,'completed':sum(1 for c in checks if c['done']),'total':len(checks)}
+
+
+def privacy_trust(slug):
+    return {'ai_profile':'A Consultora usa catálogo, regras de margem, tom e histórico de conversa da loja para responder. Não cria produtos, preços ou descontos que não estejam confirmados.',
+            'data_use':'Os dados persistidos são usados para catálogo, pedidos, atendimento e auditoria da própria loja.',
+            'memory':'A memória de atendimento é separada por loja e sessão de cliente; o modo Concierge não adiciona memória comercial.',
+            'controls':'Você pode revisar as regras da IA e consultar o histórico de auditoria no painel.',
+            'deletion':'Controles de exclusão/exportação completos ainda não estão disponíveis nesta fase; não prometemos uma API que não existe.',
+            'sensitive_data':'O registro de auditoria não deve conter emoções, saúde, inferências sensíveis ou conteúdo desnecessário.'}
+
+
 def marketplace_summary(slug):
     orders=store_orders(slug); paid=[o for o in orders if o.get('status')=='Pago']; gross=round(sum(price_number(o.get('price')) for o in paid),2); commission=round(sum(float(o.get('commission_amount',round(price_number(o.get('price'))*PLATFORM_COMMISSION_RATE,2))) for o in paid),2); seller_net=round(gross-commission,2)
     return {'orders_paid':len(paid),'gross_sales':gross,'platform_commission':commission,'seller_net_estimate':seller_net,'split_status':'Aguardando conexão OAuth do vendedor'}
@@ -746,8 +779,12 @@ def create_project(name, prompt):
 def vendacerta_page():
     files=vendacerta_files()
     page=files['index.html']
-    page=page.replace('<link rel="stylesheet" href="styles.css">','<style>'+files['styles.css']+'</style>')
-    page=page.replace('<script src="app.js"></script>','<script>'+files['app.js'].replace('</script>','<\\/script>')+'</script>')
+    # Production-safe foundation panel is injected without altering existing storefront flows.
+    panel='''<section id="foundationPanel" class="view" aria-labelledby="foundationTitle"><div class="section-heading"><small>CONFIANÇA E CONTROLE</small><h2 id="foundationTitle">Sua loja pronta</h2><p class="muted">Orientações e métricas reais para começar. Nada aqui inventa vendas ou automatiza descontos.</p></div><div id="onboardingCard" class="product"><div id="onboardingContent">Carregando checklist…</div></div><div id="metricsCard" class="product"><h3>Métricas da loja</h3><div id="metricsContent">Carregando dados persistidos…</div></div><div id="pilotCard" class="product"><h3>Piloto seguro da IA</h3><p class="muted">A IA está em modo sugestão: recomendações exigem sua aprovação e nunca aplicam descontos sozinhas.</p><p id="pilotState"><strong>Estado:</strong> sugestões somente · aprovação humana necessária</p></div><div id="privacyCard" class="product"><h3>Privacidade e confiança</h3><div id="privacyContent">Carregando informações…</div></div><div id="auditCard" class="product"><h3>Histórico de auditoria</h3><p class="muted">Eventos da sua loja, sem conteúdo emocional sensível.</p><div id="auditContent">Carregando…</div></div></section>'''
+    page=page.replace('</main>',panel+'</main>')
+    page=page.replace('<link rel="stylesheet" href="styles.css">','<style>'+files['styles.css']+'#foundationPanel{padding:28px 5%;max-width:900px;margin:auto}.view:not(.active){display:none}.product{padding:20px;margin:12px 0;border-radius:18px}.muted{color:#64748b}.check{padding:8px 0}.check.done{text-decoration:line-through;opacity:.7}@media(max-width:700px){#foundationPanel{padding:20px 16px}}button,input,select{font-size:16px}button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #06b6d4;outline-offset:2px}</style>')
+    extra_js='''async function loadFoundation(){if(!authUser)return;const q='?loja='+encodeURIComponent(storeSlug);try{const [o,m,p,a]=await Promise.all([fetch('/api/onboarding'+q),fetch('/api/metrics'+q),fetch('/api/privacy'+q),fetch('/api/audit'+q)]);const od=await o.json(),md=await m.json(),pd=await p.json(),ad=await a.json();if(od.checklist){$('onboardingContent').innerHTML=od.checklist.checks.map(c=>'<div class="check '+(c.done?'done':'')+'" role="listitem">'+(c.done?'✓ ':'○ ')+safeText(c.label)+'</div>').join('')+'<p><strong>'+od.checklist.completed+'/'+od.checklist.total+'</strong> concluídos · '+(od.checklist.ready?'Loja pronta para começar.':'Complete os itens essenciais.')+'</p>'}if(md.metrics){const x=md.metrics;$('metricsContent').innerHTML='<p>Produtos: <strong>'+x.catalog_products+'</strong> · Pedidos: <strong>'+x.orders_total+'</strong> · Pagos: <strong>'+x.orders_paid+'</strong></p><p>Vendas pagas: <strong>R$ '+Number(x.gross_paid||0).toFixed(2).replace('.',',')+'</strong></p><p class="muted">'+safeText(x.note)+' '+(x.data_sufficiency==='insufficient'?'Ainda há poucos dados para conclusões confiáveis.':'Base inicial; não é previsão.')+'</p>'}if(pd.privacy){const x=pd.privacy;$('privacyContent').innerHTML='<p>'+safeText(x.ai_profile)+'</p><p>'+safeText(x.data_use)+'</p><p>'+safeText(x.memory)+'</p><p>'+safeText(x.controls)+'</p><p><strong>Exclusão/exportação:</strong> '+safeText(x.deletion)+'</p>'}if(ad.events){$('auditContent').innerHTML=ad.events.length?ad.events.slice(-12).reverse().map(e=>'<div class="check"><strong>'+safeText(e.event)+'</strong> · '+new Date(Number(e.at)*1000).toLocaleString('pt-BR')+'</div>').join(''):'<p class="muted">Nenhum evento registrado ainda.</p>'}}catch(e){toast('Não foi possível carregar o painel de confiança agora.')}}const _setAuth=setAuth;setAuth=function(u){_setAuth(u);if(u){loadFoundation()}};document.querySelectorAll('[data-view]').forEach(b=>{if(b.dataset.view==='foundationPanel')b.onclick=()=>{view('foundationPanel');loadFoundation()}});const foundationButton=document.createElement('button');foundationButton.className='outline';foundationButton.textContent='Loja pronta · confiança';foundationButton.setAttribute('aria-label','Abrir checklist, métricas e privacidade');foundationButton.onclick=()=>{if(!authUser){openLogin();return}view('foundationPanel');loadFoundation()};document.querySelector('header,nav')?.appendChild(foundationButton);'''
+    page=page.replace('<script src="app.js"></script>','<script>'+files['app.js'].replace('</script>','<\\/script>')+extra_js+'</script>')
     return page.encode('utf-8')
 
 
@@ -846,6 +883,13 @@ class Handler(SimpleHTTPRequestHandler):
             if not current or current.get('slug') != slug:
                 return self.end_json({'error':'Acesso não autorizado ao histórico de auditoria.'},401)
             return self.end_json({'ok':True,'slug':slug,'events':tenant_audit_events(slug)})
+        if path in ('/api/onboarding','/api/metrics','/api/privacy'):
+            slug=parse_qs(urlparse(self.path).query).get('loja',[''])[0].strip(); current=session_user(self)
+            if not current or current.get('slug') != slug:
+                return self.end_json({'error':'Acesso não autorizado a esta loja.'},401)
+            if path=='/api/onboarding': return self.end_json({'ok':True,'slug':slug,'checklist':onboarding_checklist(slug)})
+            if path=='/api/metrics': return self.end_json({'ok':True,'slug':slug,'metrics':tenant_metrics(slug)})
+            return self.end_json({'ok':True,'slug':slug,'privacy':privacy_trust(slug)})
         if path=='/api/marketplace/summary':
             slug=parse_qs(urlparse(self.path).query).get('loja',['vendacertaai'])[0]; current=session_user(self)
             if not current or current.get('slug') != slug: return self.end_json({'error':'Faça login para acessar o resumo financeiro.'},401)
@@ -1051,7 +1095,7 @@ class Handler(SimpleHTTPRequestHandler):
                 raw=body.get('settings',{}); base=agent_settings(slug)
                 try: min_margin=max(0,min(100,float(raw.get('min_margin',base['min_margin'])))); max_discount=max(0,min(100,float(raw.get('max_discount',base['max_discount']))))
                 except Exception: return self.end_json({'error':'Informe percentuais válidos.'},400)
-                settings={'min_margin':round(min_margin,2),'max_discount':round(max_discount,2),'require_approval':bool(raw.get('require_approval',base['require_approval'])),'tone':str(raw.get('tone',base['tone']))[:30],'persona_name':str(raw.get('persona_name',base['persona_name'])).strip()[:60] or base['persona_name'],'persona_description':str(raw.get('persona_description',base['persona_description'])).strip()[:180] or base['persona_description']}
+                settings={'min_margin':round(min_margin,2),'max_discount':round(max_discount,2),'require_approval':bool(raw.get('require_approval',base['require_approval'])),'tone':str(raw.get('tone',base['tone']))[:30],'persona_name':str(raw.get('persona_name',base['persona_name'])).strip()[:60] or base['persona_name'],'persona_description':str(raw.get('persona_description',base['persona_description'])).strip()[:180] or base['persona_description'],'pilot_mode':True}
                 if settings['tone'] not in ('consultivo','direto','acolhedor'): settings['tone']='consultivo'
                 save_agent_settings(slug,settings)
                 return self.end_json({'ok':True,'slug':slug,'settings':settings})
