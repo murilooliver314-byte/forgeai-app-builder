@@ -823,6 +823,9 @@ html.customer-request header nav{display:none!important}
 html.customer-request #home .actions{display:none!important}
 html.customer-request:not(.customer-entered) main .view:not(#store){display:none!important}
 html.customer-request.customer-ready main .view#store{display:block!important}
+/* A public customer link must never become visually empty while JS/auth settles. */
+html.customer-request main .view#store{display:block!important;visibility:visible!important;opacity:1!important}
+html.customer-request #store #products{display:grid!important;visibility:visible!important}
 html.customer-request #backBtn{display:none!important}
 /* The entrepreneur landing screen is intentionally limited to its two entry actions.
    Keep platform navigation out of the DOM's visible UI until session resolution succeeds. */
