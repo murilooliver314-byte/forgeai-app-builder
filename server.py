@@ -822,10 +822,11 @@ html.customer-request header nav,html.customer-request #headerLogin,html.custome
 html.customer-request header nav{display:none!important}
 html.customer-request #home .actions{display:none!important}
 html.customer-request:not(.customer-entered) main .view:not(#store){display:none!important}
-html.customer-request.customer-ready main .view#store{display:block!important}
-/* A public customer link must never become visually empty while JS/auth settles. */
-html.customer-request main .view#store{display:block!important;visibility:visible!important;opacity:1!important}
-html.customer-request #store #products{display:grid!important;visibility:visible!important}
+html.customer-request.customer-ready main .view#productsView{display:block!important}
+/* A public customer link opens the actual catalog view, not the entrepreneur landing shell. */
+html.customer-request main .view#productsView{display:block!important;visibility:visible!important;opacity:1!important}
+html.customer-request #store,html.customer-request #home,html.customer-request #videos,html.customer-request #assistant{display:none!important}
+html.customer-request #productsView .section-head .actions,html.customer-request #productsView #productsAdmin{display:none!important}
 html.customer-request #backBtn{display:none!important}
 /* The entrepreneur landing screen is intentionally limited to its two entry actions.
    Keep platform navigation out of the DOM's visible UI until session resolution succeeds. */
@@ -870,7 +871,7 @@ const oldChatForm=$('chatForm');new MutationObserver(()=>{document.querySelector
     document.querySelector('#videos .section-head .actions')?.remove();
     const title=document.querySelector('#store h2'); if(title)title.textContent='Produtos da loja';
     const copy=document.querySelector('#store p'); if(copy)copy.textContent='Escolha um produto ou fale com a vendedora.';
-    if(typeof view==='function')view('store',false);
+    if(typeof view==='function')view('productsView',false);
     if(typeof loadProducts==='function')loadProducts();
     if(typeof loadVideos==='function')loadVideos();
   }
