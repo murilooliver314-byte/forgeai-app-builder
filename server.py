@@ -824,7 +824,7 @@ html.customer-request #home .actions{display:none!important}
 html.customer-request:not(.customer-entered) main .view:not(#store){display:none!important}
 html.customer-request.customer-ready main .view#productsView{display:block!important}
 /* A public customer link opens the actual catalog view, not the entrepreneur landing shell. */
-html.customer-request main .view#productsView{display:block!important;visibility:visible!important;opacity:1!important}
+html.customer-request main .view#productsView,html.customer-request:not(.customer-entered) main .view#productsView{display:block!important;visibility:visible!important;opacity:1!important}
 html.customer-request #store,html.customer-request #home,html.customer-request #videos,html.customer-request #assistant{display:none!important}
 html.customer-request #productsView .section-head .actions,html.customer-request #productsView #productsAdmin{display:none!important}
 html.customer-request body #productsView{display:block!important;visibility:visible!important;opacity:1!important}
