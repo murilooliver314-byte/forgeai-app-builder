@@ -827,6 +827,8 @@ html.customer-request.customer-ready main .view#productsView{display:block!impor
 html.customer-request main .view#productsView{display:block!important;visibility:visible!important;opacity:1!important}
 html.customer-request #store,html.customer-request #home,html.customer-request #videos,html.customer-request #assistant{display:none!important}
 html.customer-request #productsView .section-head .actions,html.customer-request #productsView #productsAdmin{display:none!important}
+html.customer-request body #productsView{display:block!important;visibility:visible!important;opacity:1!important}
+html.customer-request body #productsView #products{display:grid!important;visibility:visible!important}
 html.customer-request #backBtn{display:none!important}
 /* The entrepreneur landing screen is intentionally limited to its two entry actions.
    Keep platform navigation out of the DOM's visible UI until session resolution succeeds. */
