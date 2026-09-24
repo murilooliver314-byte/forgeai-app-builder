@@ -933,7 +933,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path=urlparse(self.path).path
         if path in ('/vendacertaai','/vendacertaai/'):
-            raw=vendacerta_page(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            raw=vendacerta_page(); user=session_user(self); boot_user=json.dumps({k:user.get(k) for k in ('id','name','business','slug','trial_ends_at')} if user else {},ensure_ascii=False).replace('<','\u003c'); raw=raw.replace(b'</body>',('<script>setTimeout(function(){try{var u='+boot_user+';if(typeof enterStore==="function")enterStore(u,"Sessão recuperada")}catch(e){}},0)</script></body>').encode('utf-8')) if user else raw; self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if path=='/api/health':
             storage=storage_status()
             return self.end_json({'ok':True,'service':'ForgeAI','storage':storage,'readiness':'durable' if storage['durable'] else 'beta'})
