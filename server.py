@@ -821,14 +821,14 @@ def vendacerta_page():
     gallery_css='''<style>
 .gallery-picker{display:grid;gap:8px;padding:12px;border:1px dashed #94a3b8;border-radius:12px}.gallery-preview{display:flex;gap:8px;overflow-x:auto}.gallery-preview img{width:68px;height:68px;object-fit:cover;border-radius:9px}.gallery-preview button{font-size:11px}.detail-gallery{position:relative}.detail-gallery img{width:100%;max-height:55vh;object-fit:contain;border-radius:14px}.detail-gallery .gallery-nav{display:flex;justify-content:space-between;margin-top:8px}.speech-control{margin-left:8px;padding:5px 9px;border-radius:8px;font-size:11px}.video-feed{display:flex!important;overflow-x:auto!important;scroll-snap-type:x mandatory!important;gap:14px!important}.video-card{flex:0 0 min(92vw,430px)!important;min-height:70vh!important;height:calc(100svh - 150px)!important;scroll-snap-align:center!important}.video-card video{height:100%!important;object-fit:cover!important}.video-overlay{padding:80px 18px 20px!important}.negotiation-note{padding:10px;border:1px solid #fbbf24;border-radius:10px;color:#92400e;font-size:12px;margin-top:10px}.customer-storefront header{position:sticky;top:0;z-index:10}.customer-storefront header nav{display:flex;align-items:center;gap:8px;flex:1}.customer-storefront header nav button{display:inline-flex}.customer-storefront .customer-tab{border:0;background:transparent;color:#64748b;padding:10px 14px;border-radius:999px;font-weight:700}.customer-storefront .customer-tab.active{background:#e0f2fe;color:#0369a1}.customer-storefront .customer-chat{margin-left:auto}.customer-storefront main{padding-top:8px}.customer-storefront #videos .video-admin{display:none!important}.customer-storefront #assistant .agent-controls{display:none!important}.customer-storefront #assistant{max-width:760px;margin:auto}.customer-storefront .product-art{cursor:pointer}.customer-storefront .beta-banner{display:none}
 /* Customer links are safe before any asynchronous auth request completes. */
-html.customer-request header nav,html.customer-request #headerLogin,html.customer-request #accountBadge,html.customer-request #themeBtn,html.customer-request #backBtn,html.customer-request #trialBtn,html.customer-request #loginBtn,html.customer-request #trialHelp,html.customer-request #planAccessBtn,html.customer-request #admBtn{display:none!important}
-html.customer-request header nav{display:none!important}
+html.customer-request #headerLogin,html.customer-request #accountBadge,html.customer-request #themeBtn,html.customer-request #backBtn,html.customer-request #trialBtn,html.customer-request #loginBtn,html.customer-request #trialHelp,html.customer-request #planAccessBtn,html.customer-request #admBtn{display:none!important}
+html.customer-request:not(.customer-entered) header nav{display:none!important}
 html.customer-request #home .actions{display:none!important}
 html.customer-request:not(.customer-entered) main .view:not(#store){display:none!important}
 html.customer-request.customer-ready main .view#store{display:block!important}
 /* A public customer link opens the real storefront with its public product grid. */
 html.customer-request main .view#store,html.customer-request:not(.customer-entered) main .view#store{display:block!important;visibility:visible!important;opacity:1!important}
-html.customer-request #home,html.customer-request #videos,html.customer-request #assistant,html.customer-request #productsView{display:none!important}
+html.customer-request #home,html.customer-request #productsView{display:none!important}
 html.customer-request #store .section-head .actions{display:none!important}
 html.customer-request body #store{display:block!important;visibility:visible!important;opacity:1!important}
 html.customer-request body #store #products{display:grid!important;visibility:visible!important}
@@ -869,7 +869,7 @@ const oldChatForm=$('chatForm');new MutationObserver(()=>{document.querySelector
     document.documentElement.classList.add('customer-ready','customer-entered');
     document.querySelector('.beta-banner')?.remove();
     ['#headerLogin','#accountBadge','#themeBtn','#trialBtn','#loginBtn','#trialHelp','#planAccessBtn','#admBtn','#videoAdmin','#foundationPanel','#backBtn'].forEach(s=>document.querySelector(s)?.remove());
-    const nav=document.querySelector('header nav'); if(nav){nav.innerHTML='';nav.style.display='none';}
+    const nav=document.querySelector('header nav'); if(nav){nav.innerHTML='<button type="button" class="customer-tab active" data-customer-view="store">Produtos</button><button type="button" class="customer-tab" data-customer-view="videos">Vídeos</button><button type="button" class="customer-tab customer-chat" data-customer-view="assistant">Falar com a vendedora</button>';nav.style.display='flex';nav.querySelectorAll('[data-customer-view]').forEach(b=>b.onclick=()=>{const target=b.dataset.customerView;view(target,false);nav.querySelectorAll('.customer-tab').forEach(x=>x.classList.toggle('active',x===b))})}
     const home=el('home'); if(home)home.classList.remove('active');
     document.querySelector('#home .actions')?.remove();
     document.querySelector('#store .section-head .actions')?.remove();
