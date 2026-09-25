@@ -825,7 +825,7 @@ html.customer-request #headerLogin,html.customer-request #accountBadge,html.cust
 html.customer-request:not(.customer-entered) header nav{display:none!important}
 html.customer-request #home .actions{display:none!important}
 html.customer-request:not(.customer-entered) main .view:not(#store){display:none!important}
-html.customer-request.customer-ready main .view#store{display:block!important}
+html.customer-request.customer-ready main .view#store{display:block!important}html.customer-request.customer-entered main .view#store:not(.active),html.customer-request.customer-entered main .view#videos:not(.active),html.customer-request.customer-entered main .view#assistant:not(.active){display:none!important}
 /* A public customer link opens the real storefront with its public product grid. */
 html.customer-request main .view#store,html.customer-request:not(.customer-entered) main .view#store{display:block!important;visibility:visible!important;opacity:1!important}
 html.customer-request #home,html.customer-request #productsView{display:none!important}
